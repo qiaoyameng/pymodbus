@@ -5,10 +5,19 @@ from __future__ import annotations
 import struct
 from dataclasses import dataclass
 
+from ..constants import ExcCodes
 from ..datastore import ModbusServerContext
 from ..exceptions import ModbusException
 from .decoders import DecodePDU
+from .exceptionresponse import ExceptionResponse
 from .pdu import ModbusPDU
+
+
+#: Reference type mandated by the Modbus specification for file records.
+REFERENCE_TYPE = 0x06
+
+#: Highest valid record number within a file (Modbus specification).
+MAX_RECORD_NUMBER = 0x270F
 
 
 @dataclass
@@ -19,6 +28,7 @@ class FileRecord:
     record_number: int = 0
     record_data: bytes = b""
     record_length: int = 0
+    reference_type: int = REFERENCE_TYPE
 
     def __post_init__(self) -> None:
         """Initialize a new instance."""
@@ -53,7 +63,7 @@ class ReadFileRecordRequest(ModbusPDU):
         for record in self.records:
             packet += struct.pack(
                 ">BHHH",
-                0x06,
+                record.reference_type,
                 record.file_number,
                 record.record_number,
                 record.record_length,
@@ -70,20 +80,51 @@ class ReadFileRecordRequest(ModbusPDU):
             record = FileRecord(
                 file_number=decoded[1],
                 record_number=decoded[2],
-                record_length=decoded[3],
+                reference_type=decoded[0],
             )
+            record.record_length = decoded[3]
             self.records.append(record)
 
     async def datastore_update(
         self, context: ModbusServerContext, device_id: int
     ) -> ModbusPDU:
         """Update diagnostic request on the given device."""
-        _ = context
+        store = context.file_records.get(device_id, {})
+        response_records = []
         for record in self.records:
-            record.record_data = b"SERVER DUMMY RECORD."
-            record.record_length = len(record.record_data) // 2
+            if record.reference_type != REFERENCE_TYPE:
+                return ExceptionResponse(
+                    self.function_code,
+                    ExcCodes.ILLEGAL_VALUE,
+                    device_id=device_id,
+                    transaction=self.transaction_id,
+                )
+            if (
+                record.record_length < 1
+                or record.record_number + record.record_length - 1 > MAX_RECORD_NUMBER
+            ):
+                return ExceptionResponse(
+                    self.function_code,
+                    ExcCodes.ILLEGAL_ADDRESS,
+                    device_id=device_id,
+                    transaction=self.transaction_id,
+                )
+            file_store = store.get(record.file_number, {})
+            record_data = b"".join(
+                struct.pack(">H", file_store.get(record.record_number + offset, 0))
+                for offset in range(record.record_length)
+            )
+            response_records.append(
+                FileRecord(
+                    file_number=record.file_number,
+                    record_number=record.record_number,
+                    record_data=record_data,
+                )
+            )
         return ReadFileRecordResponse(
-            records=self.records, dev_id=device_id, transaction_id=self.transaction_id
+            records=response_records,
+            dev_id=device_id,
+            transaction_id=self.transaction_id,
         )
 
 
@@ -118,12 +159,13 @@ class ReadFileRecordResponse(ModbusPDU):
         self.records.clear()
         byte_count = int(data[0])
         while count < byte_count:
-            calc_length, _ = struct.unpack(">BB", data[count : count + 2])
+            calc_length, reference_type = struct.unpack(">BB", data[count : count + 2])
             count += 2
 
             record_length = calc_length - 1  # response length includes the type byte
             record = FileRecord(
                 record_data=data[count : count + record_length],
+                reference_type=reference_type,
             )
             count += record_length
             self.records.append(record)
@@ -153,7 +195,7 @@ class WriteFileRecordRequest(ModbusPDU):
         for record in self.records:
             packet += struct.pack(
                 ">BHHH",
-                0x06,
+                record.reference_type,
                 record.file_number,
                 record.record_number,
                 record.record_length,
@@ -175,6 +217,7 @@ class WriteFileRecordRequest(ModbusPDU):
                 file_number=decoded[1],
                 record_number=decoded[2],
                 record_data=data[count - calc_length : count],
+                reference_type=decoded[0],
             )
             record.record_length = decoded[3]
             self.records.append(record)
@@ -183,7 +226,55 @@ class WriteFileRecordRequest(ModbusPDU):
         self, context: ModbusServerContext, device_id: int
     ) -> ModbusPDU:
         """Update diagnostic request on the given device."""
-        _ = context
+        # Validate all sub-records before committing anything, so a
+        # faulty sub-record leaves the file record store untouched.
+        pending: list[tuple[int, int, tuple[int, ...]]] = []
+        written_ranges: dict[int, list[tuple[int, int]]] = {}
+        for record in self.records:
+            if record.reference_type != REFERENCE_TYPE:
+                return ExceptionResponse(
+                    self.function_code,
+                    ExcCodes.ILLEGAL_VALUE,
+                    device_id=device_id,
+                    transaction=self.transaction_id,
+                )
+            if (
+                record.record_length < 1
+                or len(record.record_data) != record.record_length * 2
+            ):
+                return ExceptionResponse(
+                    self.function_code,
+                    ExcCodes.ILLEGAL_VALUE,
+                    device_id=device_id,
+                    transaction=self.transaction_id,
+                )
+            if record.record_number + record.record_length - 1 > MAX_RECORD_NUMBER:
+                return ExceptionResponse(
+                    self.function_code,
+                    ExcCodes.ILLEGAL_ADDRESS,
+                    device_id=device_id,
+                    transaction=self.transaction_id,
+                )
+            start = record.record_number
+            end = start + record.record_length
+            for other_start, other_end in written_ranges.setdefault(
+                record.file_number, []
+            ):
+                if start < other_end and other_start < end:
+                    return ExceptionResponse(
+                        self.function_code,
+                        ExcCodes.ILLEGAL_VALUE,
+                        device_id=device_id,
+                        transaction=self.transaction_id,
+                    )
+            written_ranges[record.file_number].append((start, end))
+            values = struct.unpack(f">{record.record_length}H", record.record_data)
+            pending.append((record.file_number, start, values))
+        store = context.file_records.setdefault(device_id, {})
+        for file_number, start, values in pending:
+            file_store = store.setdefault(file_number, {})
+            for offset, value in enumerate(values):
+                file_store[start + offset] = value
         return WriteFileRecordResponse(
             records=self.records, dev_id=device_id, transaction_id=self.transaction_id
         )
@@ -212,7 +303,7 @@ class WriteFileRecordResponse(ModbusPDU):
         for record in self.records:
             packet += struct.pack(
                 ">BHHH",
-                0x06,
+                record.reference_type,
                 record.file_number,
                 record.record_number,
                 record.record_length,
@@ -233,6 +324,7 @@ class WriteFileRecordResponse(ModbusPDU):
                 file_number=decoded[1],
                 record_number=decoded[2],
                 record_data=data[count - calc_length : count],
+                reference_type=decoded[0],
             )
             record.record_length = decoded[3]
             self.records.append(record)

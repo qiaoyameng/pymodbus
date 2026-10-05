@@ -102,6 +102,9 @@ class ModbusServerContext:
         self.old_simulator = False
         self._devices: dict[int, ModbusDeviceContext | ModbusSimulatorContext]
         self.simdevices: list[SimDevice] = []
+        #: In-memory file record storage (FC 0x14/0x15), organized as
+        #: device_id -> file_number -> record_number -> 16 bit register.
+        self.file_records: dict[int, dict[int, dict[int, int]]] = {}
         if isinstance(devices, dict):
             self._devices = devices
             for dev_id, entry in devices.items():
