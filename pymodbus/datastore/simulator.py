@@ -6,7 +6,7 @@ import dataclasses
 import enum
 import random
 import struct
-from collections.abc import Callable
+from collections.abc import Awaitable, Callable
 from datetime import datetime
 from typing import Any
 
@@ -93,6 +93,7 @@ class Label:  # pylint: disable=too-many-instance-attributes
     action: str = "action"
     addr: str = "addr"
     any: str = "any"
+    clear_on_read: str = "clear on read"
     co_size: str = "co size"
     defaults: str = "defaults"
     di_size: str = "di size"
@@ -100,6 +101,7 @@ class Label:  # pylint: disable=too-many-instance-attributes
     increment: str = "increment"
     invalid: str = "invalid"
     ir_size: str = "ir size"
+    latch_on_read: str = "latch on read"
     parameters: str = "parameters"
     method: str = "method"
     next: str = "next"
@@ -372,6 +374,29 @@ class Setup:
                 )
         del self.config[Label.repeat]
 
+    def handle_read_semantics(self):
+        """Handle clear on read / latch on read sections."""
+        for section, attr in (
+            (Label.clear_on_read, "clear_on_read"),
+            (Label.latch_on_read, "latch_on_read"),
+        ):
+            target: set[int] = set()
+            for entry in Label.try_get_default(section, self.config, []):
+                if isinstance(entry, int):
+                    entry = [entry, entry]
+                for i in range(entry[0], entry[1] + 1):
+                    if i >= self.runtime.register_count:
+                        raise RuntimeError(
+                            f'Error section "{section}" addr {entry} out of range'
+                        )
+                    if self.runtime.registers[i].type == CellType.INVALID:
+                        raise RuntimeError(
+                            f'ERROR Configuration invalid in section "{section}" register {i} not defined'
+                        )
+                    target.add(i)
+            setattr(self.runtime, attr, target)
+            self.config.pop(section, None)
+
     def setup(self, config, custom_actions) -> None:
         """Load layout from dict with json structure."""
         actions = {
@@ -398,6 +423,7 @@ class Setup:
         self.handle_types()
         self.handle_write_allowed()
         self.handle_repeat()
+        self.handle_read_semantics()
         if self.config:
             raise RuntimeError(f"INVALID key in setup: {self.config}")
 
@@ -488,8 +514,34 @@ class ModbusSimulatorContext:
             ],
             "repeat": [ --> allows to repeat section e.g. for n devices
                 {"addr": [100, 200], "to": [50, 275]}   --> Repeat registers 100-200 to 50+ until 275
+            ],
+            "clear on read": [  --> List of registers cleared after a successful read
+                51,                --> single register
+                [78, 99],         --> start, end registers, repeated as needed
+            ],
+            "latch on read": [  --> List of registers latched (snapshot) at read start
+                [100, 101],       --> start, end registers, repeated as needed
             ]
         }
+
+    A read request is handled in 3 steps:
+
+    1. latch: registers defined in "latch on read" are snapshotted, guaranteeing
+       that multi register values (e.g. a 32 bit counter) are returned as one
+       consistent version, even if updated concurrently. The latch is valid for
+       this request only, the next request latches anew.
+    2. response: the response is built from the latched snapshot (latched
+       registers) resp. the current cell values (other registers).
+    3. clear: registers defined in "clear on read" and hit by this request are
+       cleared. If the request is invalid or the response cannot be built,
+       nothing is cleared.
+
+    Both semantics are defined per register and can be combined freely.
+    Registers not covered by "clear on read" are never cleared, even if a
+    neighbouring register in the same request is.
+
+    The attribute "read_barrier" (None or an async callable) is a test hook,
+    awaited after latching and before the response is built.
     """
 
     # --------------------------------------------
@@ -508,6 +560,9 @@ class ModbusSimulatorContext:
         self.action_name_to_id: dict[str, int] = {}
         self.action_id_to_name: list[str] = []
         self.action_methods: list[Callable] = []
+        self.clear_on_read: set[int] = set()
+        self.latch_on_read: set[int] = set()
+        self.read_barrier: Callable[[], Awaitable[None]] | None = None
         if config:
             Setup(self).setup(config, custom_actions)
         Log.warning(
@@ -631,34 +686,71 @@ class ModbusSimulatorContext:
         """
         if not self.validate(func_code, address, count):
             return ExcCodes.ILLEGAL_ADDRESS
-        result = []
         if func_code not in self._bits_func_code:
             real_address = self.fc_offset[func_code] + address
-            for i in range(real_address, real_address + count):
-                reg = self.registers[i]
-                parameters = reg.action_parameters if reg.action_parameters else {}
-                if reg.action:
-                    self.action_methods[reg.action](self.registers, i, **parameters)
+            reg_range = range(real_address, real_address + count)
+            self._run_read_actions(reg_range)
+            latched = self._latch_snapshot(reg_range)
+            if self.read_barrier is not None:
+                await self.read_barrier()
+            result = []
+            for i in reg_range:
+                self.registers[i].count_read += 1
+                result.append(latched.get(i, self.registers[i].value))
+            self._clear_after_read(reg_range)
+            return result
 
-                self.registers[i].count_read += 1
-                result.append(reg.value)
-        else:
-            # bit access
-            real_address = self.fc_offset[func_code] + address // 16
-            bit_index = address % 16
-            reg_count = (count + bit_index + 15) // 16
-            for i in range(real_address, real_address + reg_count):
-                reg = self.registers[i]
-                if reg.action:
-                    parameters = reg.action_parameters or {}
-                    self.action_methods[reg.action](self.registers, i, **parameters)
-                self.registers[i].count_read += 1
-                while count and bit_index < 16:
-                    result.append(bool(reg.value & (2**bit_index)))
-                    count -= 1
-                    bit_index += 1
-                bit_index = 0
+        # bit access
+        real_address = self.fc_offset[func_code] + address // 16
+        bit_index = address % 16
+        reg_count = (count + bit_index + 15) // 16
+        reg_range = range(real_address, real_address + reg_count)
+        self._run_read_actions(reg_range)
+        latched = self._latch_snapshot(reg_range)
+        if self.read_barrier is not None:
+            await self.read_barrier()
+        result = []
+        for i in reg_range:
+            self.registers[i].count_read += 1
+            value = latched.get(i, self.registers[i].value)
+            while count and bit_index < 16:
+                result.append(bool(value & (2**bit_index)))
+                count -= 1
+                bit_index += 1
+            bit_index = 0
+        self._clear_after_read(reg_range)
         return result
+
+    def _run_read_actions(self, reg_range) -> None:
+        """Run actions for registers in the read range.
+
+        :meta private:
+        """
+        for i in reg_range:
+            reg = self.registers[i]
+            if reg.action:
+                parameters = reg.action_parameters or {}
+                self.action_methods[reg.action](self.registers, i, **parameters)
+
+    def _latch_snapshot(self, reg_range) -> dict[int, int]:
+        """Snapshot values of registers configured as latch on read.
+
+        :meta private:
+        """
+        return {
+            i: self.registers[i].value
+            for i in reg_range
+            if i in self.latch_on_read
+        }
+
+    def _clear_after_read(self, reg_range) -> None:
+        """Clear registers configured as clear on read hit by this request.
+
+        :meta private:
+        """
+        for i in reg_range:
+            if i in self.clear_on_read:
+                self.registers[i].value = 0
 
     async def async_OLD_setValues(self, func_code, address, values) -> ExcCodes | None:
         """Set the requested values of the datastore.

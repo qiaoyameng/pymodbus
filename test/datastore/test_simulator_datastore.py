@@ -1,6 +1,7 @@
 #  zuban: ignore
 """Test datastore."""
 
+import asyncio
 import copy
 
 import pytest
@@ -625,3 +626,202 @@ class TestDatastoreSimulator:
 
         assert CellType.is_int(celltype) == is_int
         assert CellType.is_64(celltype) == is_64
+
+
+class TestSimulatorReadSemantics:
+    """Test clear-on-read and latch-on-read register semantics."""
+
+    alarm_device = {
+        "setup": {
+            "co size": 0,
+            "di size": 0,
+            "hr size": 20,
+            "ir size": 0,
+            "shared blocks": True,
+            "type exception": False,
+            "defaults": {
+                "value": {
+                    "bits": 0,
+                    "uint16": 0,
+                    "uint32": 0,
+                },
+                "action": {
+                    "bits": None,
+                    "uint16": None,
+                    "uint32": None,
+                },
+            },
+        },
+        "invalid": [9],
+        "write": [],
+        "repeat": [],
+        "uint16": [
+            {"addr": 0, "value": 0x10},  # normal neighbour
+            {"addr": 1, "value": 0xA1},  # alarm, clear on read
+            {"addr": 2, "value": 0xB2},  # alarm, clear on read
+            {"addr": 6, "value": 0xC6},  # alarm, clear on read + latch on read
+        ],
+        "uint32": [
+            {"addr": [4, 5], "value": 0x00010002},  # wide counter, latch on read
+        ],
+        "bits": [
+            {"addr": 8, "value": 0x00FF},  # alarm bits, clear on read
+        ],
+        "clear on read": [[1, 2], 6, 8],
+        "latch on read": [[4, 6]],
+    }
+
+    @pytest.fixture(name="simulator")
+    def create_simulator(self):
+        """Create simulator context."""
+        return ModbusSimulatorContext(copy.deepcopy(self.alarm_device), None)
+
+    async def test_clear_on_read(self, simulator):
+        """Test registers are cleared after a successful read."""
+        result = await simulator.async_OLD_getValues(FX_READ_REG, 1, 1)
+        assert result == [0xA1]
+        assert simulator.registers[1].value == 0
+        # register 2 was not hit by this request
+        assert simulator.registers[2].value == 0xB2
+        result = await simulator.async_OLD_getValues(FX_READ_REG, 1, 1)
+        assert result == [0]
+
+    async def test_clear_on_read_neighbour_not_triggered(self, simulator):
+        """Test reading a normal neighbour does not clear alarms."""
+        result = await simulator.async_OLD_getValues(FX_READ_REG, 0, 1)
+        assert result == [0x10]
+        assert simulator.registers[1].value == 0xA1
+        assert simulator.registers[2].value == 0xB2
+
+    async def test_clear_on_read_overlapping(self, simulator):
+        """Test overlapping requests only clear registers they hit."""
+        result = await simulator.async_OLD_getValues(FX_READ_REG, 0, 2)
+        assert result == [0x10, 0xA1]
+        assert simulator.registers[1].value == 0
+        assert simulator.registers[2].value == 0xB2
+        result = await simulator.async_OLD_getValues(FX_READ_REG, 1, 2)
+        assert result == [0, 0xB2]
+        assert simulator.registers[2].value == 0
+
+    async def test_clear_on_read_bits(self, simulator):
+        """Test clear on read for bit access."""
+        result = await simulator.async_OLD_getValues(FX_READ_BIT, 8 * 16, 16)
+        assert result == [True] * 8 + [False] * 8
+        assert simulator.registers[8].value == 0
+
+    async def test_clear_on_read_invalid_request(self, simulator):
+        """Test an illegal request does not clear alarms."""
+        # request overlaps alarm registers but ends in an invalid register
+        result = await simulator.async_OLD_getValues(FX_READ_REG, 1, 9)
+        assert result == ExcCodes.ILLEGAL_ADDRESS
+        assert simulator.registers[1].value == 0xA1
+        assert simulator.registers[2].value == 0xB2
+        # request fully out of range
+        result = await simulator.async_OLD_getValues(FX_READ_REG, 100, 1)
+        assert result == ExcCodes.ILLEGAL_ADDRESS
+        assert simulator.registers[1].value == 0xA1
+
+    async def test_clear_on_read_failed_response(self, simulator):
+        """Test a failed response construction does not clear alarms."""
+
+        async def failing_barrier():
+            raise RuntimeError("response build failed")
+
+        simulator.read_barrier = failing_barrier
+        with pytest.raises(RuntimeError):
+            await simulator.async_OLD_getValues(FX_READ_REG, 1, 1)
+        assert simulator.registers[1].value == 0xA1
+
+    async def test_latch_wide_counter(self, simulator):
+        """Test a wide counter is read as one consistent version."""
+        latched = asyncio.Event()
+        release = asyncio.Event()
+
+        async def barrier():
+            latched.set()
+            await release.wait()
+
+        async def updater():
+            await latched.wait()
+            simulator.registers[4].value = 0x0003
+            simulator.registers[5].value = 0x0004
+            release.set()
+
+        simulator.read_barrier = barrier
+        task = asyncio.create_task(updater())
+        result = await simulator.async_OLD_getValues(FX_READ_REG, 4, 2)
+        await task
+        # update happened in the middle of the read, complete old value returned
+        assert result == [0x0001, 0x0002]
+        # latch boundary is this request, not the connection
+        simulator.read_barrier = None
+        result = await simulator.async_OLD_getValues(FX_READ_REG, 4, 2)
+        assert result == [0x0003, 0x0004]
+
+    async def test_latch_partial_wide_read(self, simulator):
+        """Test reading only a part of a wide latched field."""
+        latched = asyncio.Event()
+        release = asyncio.Event()
+
+        async def barrier():
+            latched.set()
+            await release.wait()
+
+        async def updater():
+            await latched.wait()
+            simulator.registers[4].value = 0x0003
+            simulator.registers[5].value = 0x0004
+            release.set()
+
+        simulator.read_barrier = barrier
+        task = asyncio.create_task(updater())
+        result = await simulator.async_OLD_getValues(FX_READ_REG, 4, 1)
+        await task
+        assert result == [0x0001]
+        simulator.read_barrier = None
+        result = await simulator.async_OLD_getValues(FX_READ_REG, 5, 1)
+        assert result == [0x0004]
+
+    async def test_latch_and_clear_combined(self, simulator):
+        """Test clear on read and latch on read combined on one register."""
+        latched = asyncio.Event()
+        release = asyncio.Event()
+
+        async def barrier():
+            latched.set()
+            await release.wait()
+
+        async def updater():
+            await latched.wait()
+            simulator.registers[6].value = 0x99
+            release.set()
+
+        simulator.read_barrier = barrier
+        task = asyncio.create_task(updater())
+        result = await simulator.async_OLD_getValues(FX_READ_REG, 6, 1)
+        await task
+        # latched value returned, register cleared (clear wins over the update)
+        assert result == [0xC6]
+        assert simulator.registers[6].value == 0
+
+    def test_read_semantics_config_out_of_range(self):
+        """Test exception for clear/latch ranges out of range."""
+        device = copy.deepcopy(self.alarm_device)
+        device["clear on read"] = [100]
+        with pytest.raises(RuntimeError):
+            ModbusSimulatorContext(device, None)
+        device = copy.deepcopy(self.alarm_device)
+        device["latch on read"] = [[18, 25]]
+        with pytest.raises(RuntimeError):
+            ModbusSimulatorContext(device, None)
+
+    def test_read_semantics_config_invalid_register(self):
+        """Test exception for clear/latch on an invalid register."""
+        device = copy.deepcopy(self.alarm_device)
+        device["clear on read"] = [9]
+        with pytest.raises(RuntimeError):
+            ModbusSimulatorContext(device, None)
+        device = copy.deepcopy(self.alarm_device)
+        device["latch on read"] = [9]
+        with pytest.raises(RuntimeError):
+            ModbusSimulatorContext(device, None)
