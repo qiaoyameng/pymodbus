@@ -5,10 +5,12 @@ from __future__ import annotations
 from abc import abstractmethod
 from collections.abc import Awaitable, Callable
 
+from ..constants import DeviceInformation
 from ..exceptions import ConnectionException
 from ..framer import FRAMER_NAME_TO_CLASS, FramerBase, FramerType
 from ..logging import Log
 from ..pdu import DecodePDU, ModbusPDU
+from ..pdu.mei_message import DeviceIdentificationCollector, ReadDeviceInformationResponse
 from ..transaction import TransactionManager
 from ..transport import CommParams
 from .mixin import ModbusClientMixin
@@ -84,6 +86,37 @@ class ModbusBaseClient(ModbusClientMixin[Awaitable[ModbusPDU]]):
         if not self.ctx.transport:
             raise ConnectionException(f"Not connected[{self!s}]")
         return self.ctx.execute(no_response_expected, request)  # type: ignore[unused-coroutine]
+
+    async def read_device_identification(
+        self,
+        *,
+        read_code: int = DeviceInformation.BASIC,
+        object_id: int = 0x00,
+        device_id: int = 1,
+        max_pages: int = DeviceIdentificationCollector.DEFAULT_MAX_PAGES,
+        max_bytes: int = DeviceIdentificationCollector.DEFAULT_MAX_BYTES,
+    ) -> ReadDeviceInformationResponse:
+        """Read all device identification objects (code 0x2B sub 0x0E).
+
+        :param read_code: (optional) The device information read code
+        :param object_id: (optional) The object id to start reading from
+        :param device_id: (optional) Device id
+        :param max_pages: (optional) Maximum number of pages to request
+        :param max_bytes: (optional) Maximum total size of collected object data
+        :raises DeviceIdentificationError: On inconsistent or runaway devices
+        :raises ModbusException:
+
+        Follows the ``next_object_id`` pagination automatically and returns
+        one merged response containing all objects (as raw bytes) for the
+        given read code.
+        """
+        collector = DeviceIdentificationCollector(
+            read_code, object_id, max_pages=max_pages, max_bytes=max_bytes
+        )
+        while True:
+            response = await self.execute(False, collector.next_request(dev_id=device_id))
+            if not collector.add_response(response):
+                return collector.result(dev_id=device_id)
 
     def set_max_no_responses(self, max_count: int) -> None:
         """Override default max no request responses.
@@ -185,6 +218,37 @@ class ModbusBaseSyncClient(ModbusClientMixin[ModbusPDU]):
         if not self.connect():
             raise ConnectionException(f"Failed to connect[{self!s}]")
         return self.transaction.sync_execute(no_response_expected, request)
+
+    def read_device_identification(
+        self,
+        *,
+        read_code: int = DeviceInformation.BASIC,
+        object_id: int = 0x00,
+        device_id: int = 1,
+        max_pages: int = DeviceIdentificationCollector.DEFAULT_MAX_PAGES,
+        max_bytes: int = DeviceIdentificationCollector.DEFAULT_MAX_BYTES,
+    ) -> ReadDeviceInformationResponse:
+        """Read all device identification objects (code 0x2B sub 0x0E).
+
+        :param read_code: (optional) The device information read code
+        :param object_id: (optional) The object id to start reading from
+        :param device_id: (optional) Device id
+        :param max_pages: (optional) Maximum number of pages to request
+        :param max_bytes: (optional) Maximum total size of collected object data
+        :raises DeviceIdentificationError: On inconsistent or runaway devices
+        :raises ModbusException:
+
+        Follows the ``next_object_id`` pagination automatically and returns
+        one merged response containing all objects (as raw bytes) for the
+        given read code.
+        """
+        collector = DeviceIdentificationCollector(
+            read_code, object_id, max_pages=max_pages, max_bytes=max_bytes
+        )
+        while True:
+            response = self.execute(False, collector.next_request(dev_id=device_id))
+            if not collector.add_response(response):
+                return collector.result(dev_id=device_id)
 
     def set_max_no_responses(self, max_count: int) -> None:
         """Override default max no request responses.

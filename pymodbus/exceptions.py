@@ -3,14 +3,23 @@
 Custom exceptions to be used in the Modbus code.
 """
 
+from __future__ import annotations
+
+from typing import TYPE_CHECKING, Any
+
+
 __all__ = [
     "ConnectionException",
+    "DeviceIdentificationError",
     "MessageRegisterException",
     "ModbusIOException",
     "NoSuchIdException",
     "NotImplementedException",
     "ParameterException",
 ]
+
+if TYPE_CHECKING:
+    from .pdu.pdu import ModbusPDU
 
 
 class ModbusException(Exception):
@@ -112,4 +121,30 @@ class MessageRegisterException(ModbusException):
     def __init__(self, string: str = "") -> None:
         """Initialize."""
         message = f"[Error registering message] {string}"
+        ModbusException.__init__(self, message)
+
+
+class DeviceIdentificationError(ModbusException):
+    """Error while collecting paged Read Device Identification responses.
+
+    Carries the objects collected before the failure as well as the
+    response page that caused the failure.
+    """
+
+    def __init__(
+        self,
+        string: str = "",
+        *,
+        objects: dict[int, Any] | None = None,
+        response: ModbusPDU | None = None,
+    ) -> None:
+        """Initialize the exception.
+
+        :param string: The message to append to the error
+        :param objects: Objects collected before the failure (raw bytes)
+        :param response: The response page that caused the failure
+        """
+        self.objects = objects or {}
+        self.response = response
+        message = f"[Device Identification] {string}"
         ModbusException.__init__(self, message)

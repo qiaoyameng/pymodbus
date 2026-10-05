@@ -3,10 +3,11 @@
 from __future__ import annotations
 
 import struct
-from typing import Any
+from typing import Any, NoReturn, cast
 
 from ..constants import DeviceInformation, ExcCodes, MoreData
 from ..datastore import ModbusServerContext
+from ..exceptions import DeviceIdentificationError
 from .decoders import DecodePDU
 from .device import DeviceInformationFactory, ModbusControlBlock
 from .exceptionresponse import ExceptionResponse
@@ -214,6 +215,154 @@ class ReadDeviceInformationResponse(ModbusPDU):
                     self.information[object_id],
                     data[count - object_length : count],
                 ]
+
+
+class DeviceIdentificationCollector:
+    """Collect and merge paged Read Device Identification responses.
+
+    Some devices return the device identification in several pages, each
+    pointing to the next object id to request. This class implements the
+    merge and consistency rules shared by the sync and async clients, so
+    callers do not have to hand-write the ``next_object_id`` loop.
+
+    Objects are kept as raw bytes. Repeated objects with identical content
+    are deduplicated, conflicting content raises. A device that keeps
+    returning the same page or jumps back to an already requested object id
+    is detected and terminated with an exception.
+    """
+
+    DEFAULT_MAX_PAGES = 32
+    DEFAULT_MAX_BYTES = 0xFFFF
+
+    _VALID_CONFORMITY = frozenset(
+        (*range(0x01, 0x05), *range(0x81, 0x85))
+    )
+
+    def __init__(
+        self,
+        read_code: int = DeviceInformation.BASIC,
+        object_id: int = 0x00,
+        max_pages: int = DEFAULT_MAX_PAGES,
+        max_bytes: int = DEFAULT_MAX_BYTES,
+    ) -> None:
+        """Initialize the collector.
+
+        :param read_code: The device information read code
+        :param object_id: The object id to start reading from
+        :param max_pages: Maximum number of pages to request
+        :param max_bytes: Maximum total size of collected object data
+        """
+        self.read_code = read_code
+        self.max_pages = max_pages
+        self.max_bytes = max_bytes
+        self.objects: dict[int, bytes] = {}
+        self.conformity: int | None = None
+        self.pages = 0
+        self.total_bytes = 0
+        self.done = False
+        self._current_object_id = object_id
+        self._requested_object_ids = {object_id}
+
+    def next_request(self, dev_id: int = 1) -> ReadDeviceInformationRequest:
+        """Build the request for the next page."""
+        if self.pages >= self.max_pages:
+            self._fail(f"Page limit {self.max_pages} exceeded", None)
+        return ReadDeviceInformationRequest(
+            self.read_code, self._current_object_id, dev_id=dev_id
+        )
+
+    def _fail(self, reason: str, response: ModbusPDU | None) -> NoReturn:
+        raise DeviceIdentificationError(
+            reason,
+            objects=dict(self.objects),
+            response=response,
+        )
+
+    def add_response(self, response: ModbusPDU) -> bool:
+        """Merge one response page.
+
+        :param response: The response page to merge
+        :returns: True if another page must be requested
+        :raises DeviceIdentificationError: On inconsistent or runaway devices
+        """
+        if not isinstance(response, ReadDeviceInformationResponse):
+            self._fail(f"Unexpected response {response!r}", response)
+        response = cast(ReadDeviceInformationResponse, response)
+        self.pages += 1
+        if response.read_code != self.read_code:
+            self._fail(
+                f"Read code {response.read_code} does not match requested {self.read_code}",
+                response,
+            )
+        if response.more_follows not in (MoreData.NOTHING, MoreData.KEEP_READING):
+            self._fail(
+                f"Invalid more follows {response.more_follows:#x}", response
+            )
+        if self.conformity is None:
+            if response.conformity not in self._VALID_CONFORMITY:
+                self._fail(
+                    f"Invalid conformity {response.conformity:#x}", response
+                )
+            self.conformity = response.conformity
+        elif response.conformity != self.conformity:
+            self._fail(
+                f"Conformity changed from {self.conformity:#x} to {response.conformity:#x}",
+                response,
+            )
+        self._merge_objects(response)
+        if response.more_follows == MoreData.NOTHING:
+            self.done = True
+            return False
+        next_object_id = response.next_object_id
+        if (
+            next_object_id <= self._current_object_id
+            or next_object_id in self._requested_object_ids
+        ):
+            self._fail(
+                f"Device does not advance, next object id {next_object_id:#x} "
+                f"already requested",
+                response,
+            )
+        self._requested_object_ids.add(next_object_id)
+        self._current_object_id = next_object_id
+        return True
+
+    def _merge_objects(self, response: ReadDeviceInformationResponse) -> None:
+        """Merge page objects, deduplicating identical repeats."""
+        for object_id, value in response.information.items():
+            if isinstance(value, list):
+                if any(item != value[0] for item in value):
+                    self._fail(
+                        f"Conflicting values for object {object_id:#x} in one page",
+                        response,
+                    )
+                value = value[0]
+            data = bytes(value)
+            if object_id in self.objects:
+                if self.objects[object_id] != data:
+                    self._fail(
+                        f"Conflicting content for object {object_id:#x}", response
+                    )
+                continue
+            self.total_bytes += len(data)
+            if self.total_bytes > self.max_bytes:
+                self._fail(
+                    f"Byte limit {self.max_bytes} exceeded", response
+                )
+            self.objects[object_id] = data
+
+    def result(self, dev_id: int = 1) -> ReadDeviceInformationResponse:
+        """Build the merged response with all collected objects."""
+        response = ReadDeviceInformationResponse(
+            read_code=self.read_code,
+            information=dict(self.objects),
+            dev_id=dev_id,
+        )
+        response.conformity = self.conformity or 0x00
+        response.more_follows = MoreData.NOTHING
+        response.next_object_id = 0x00
+        response.number_of_objects = len(self.objects)
+        return response
 
 
 DecodePDU.add_pdu(_EncapsulatedInterfaceTransport, _EncapsulatedInterfaceTransport)
