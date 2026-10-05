@@ -9,6 +9,7 @@ helps make pymodbus a better product.
 
 Version 3.15.0
 --------------
+* Add `read_device_information_full()` client entry, collecting all paged identification objects with loop/consistency checks (sync + async).
 * Control count in bit/register PDUs. (#2997)
 * FrameSize bug in Fifo queue ressponse. (#2996)
 * NullModem only support async clientes (#2995)

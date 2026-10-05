@@ -5,6 +5,7 @@ Custom exceptions to be used in the Modbus code.
 
 __all__ = [
     "ConnectionException",
+    "DeviceInformationException",
     "MessageRegisterException",
     "ModbusIOException",
     "NoSuchIdException",
@@ -103,6 +104,33 @@ class ConnectionException(ModbusException):
         :param string: The message to append to the error
         """
         message = f"[Connection] {string}"
+        ModbusException.__init__(self, message)
+
+
+class DeviceInformationException(ModbusException):
+    """Error while collecting a multi-page Read Device Identification response.
+
+    The exception carries the objects collected before the failure as well as
+    the page (or exception response) that triggered the error, allowing the
+    caller to inspect partial results.
+    """
+
+    def __init__(
+        self,
+        string: str = "",
+        *,
+        information: dict | None = None,
+        failed_page: object | None = None,
+    ) -> None:
+        """Initialize the exception.
+
+        :param string: The message to append to the error
+        :param information: Objects collected before the failure
+        :param failed_page: The response page that triggered the error
+        """
+        self.information: dict = dict(information or {})
+        self.failed_page = failed_page
+        message = f"[Device Information] {string}"
         ModbusException.__init__(self, message)
 
 

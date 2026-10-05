@@ -7,6 +7,7 @@ from typing import Any
 
 from ..constants import DeviceInformation, ExcCodes, MoreData
 from ..datastore import ModbusServerContext
+from ..exceptions import DeviceInformationException
 from .decoders import DecodePDU
 from .device import DeviceInformationFactory, ModbusControlBlock
 from .exceptionresponse import ExceptionResponse
@@ -214,6 +215,175 @@ class ReadDeviceInformationResponse(ModbusPDU):
                     self.information[object_id],
                     data[count - object_length : count],
                 ]
+
+
+class DeviceInformationCollector:
+    """Collect and validate all pages of a Read Device Identification reply.
+
+    The class is independent of the transport and used by both the synchronous
+    and asynchronous clients. The caller performs the actual requests using the
+    :attr:`next_object_id` while the collector merges each response page and
+    verifies that the pages are self-consistent and make forward progress.
+
+    Object values are always kept as the raw bytes returned by the device.
+    Duplicate objects containing identical bytes are de-duplicated; if a device
+    returns different bytes for the same object id the collection fails.
+    """
+
+    def __init__(
+        self,
+        read_code: int,
+        *,
+        max_pages: int | None = None,
+        max_bytes: int | None = None,
+    ) -> None:
+        """Initialize a new collector.
+
+        :param read_code: The device information read code (basic/regular/extended)
+        :param max_pages: Maximum number of pages accepted
+        :param max_bytes: Maximum total number of object bytes accepted
+        """
+        if not DeviceInformation.BASIC <= read_code <= DeviceInformation.EXTENDED:
+            raise DeviceInformationException(
+                f"Invalid read_code {read_code}, expected 1..3."
+            )
+        if max_pages is not None and max_pages < 1:
+            raise DeviceInformationException("max_pages must be >= 1.")
+        if max_bytes is not None and max_bytes < 0:
+            raise DeviceInformationException("max_bytes must be >= 0.")
+        self.read_code = read_code
+        self.max_pages = max_pages
+        self.max_bytes = max_bytes
+        self.next_object_id = 0x00
+        self.pages = 0
+        self.information: dict[int, bytes] = {}
+        self.conformity: int | None = None
+        self.complete = False
+        self._total_bytes = 0
+
+    @staticmethod
+    def _iter_objects(page: ReadDeviceInformationResponse):
+        """Yield (object id, raw bytes) pairs contained in a response page."""
+        for object_id, value in page.information.items():
+            if isinstance(value, list):
+                for item in value:
+                    yield object_id, item
+            else:
+                yield object_id, value
+
+    def _raise(self, text: str, page: ModbusPDU) -> None:
+        """Raise with the objects collected so far and the failing page."""
+        raise DeviceInformationException(
+            text, information=self.information, failed_page=page
+        )
+
+    def add_page(self, page: ModbusPDU) -> bool:
+        """Merge one response page.
+
+        :param page: A decoded ``ReadDeviceInformationResponse`` or error PDU
+        :returns: ``True`` when all pages are collected, ``False`` when another
+                  page must be requested (use :attr:`next_object_id`)
+        :raises DeviceInformationException: when the page is an error or the
+                  pages are not self-consistent or do not progress
+        """
+        if not isinstance(page, ReadDeviceInformationResponse):
+            self._raise(
+                "Unexpected response for Read Device Identification.", page
+            )
+        if page.isError():
+            self._raise("Device returned an error response.", page)
+        if page.read_code != self.read_code:
+            self._raise(
+                f"Response read_code {page.read_code} does not match "
+                f"requested read_code {self.read_code}.",
+                page,
+            )
+        if page.more_follows not in (MoreData.NOTHING, MoreData.KEEP_READING):
+            self._raise(
+                f"Invalid more_follows value {page.more_follows}.", page
+            )
+        if self.conformity is not None and page.conformity != self.conformity:
+            self._raise(
+                f"Conformity level changed from {self.conformity} "
+                f"to {page.conformity}.",
+                page,
+            )
+        self.conformity = page.conformity
+
+        objects = list(self._iter_objects(page))
+        if len(objects) != page.number_of_objects:
+            self._raise(
+                f"Page declares {page.number_of_objects} objects but "
+                f"contains {len(objects)}.",
+                page,
+            )
+
+        for object_id, value in objects:
+            if object_id in self.information:
+                if self.information[object_id] != value:
+                    self._raise(
+                        f"Conflicting content received for object id "
+                        f"{object_id}.",
+                        page,
+                    )
+            else:
+                self.information[object_id] = value
+
+        self.pages += 1
+        self._total_bytes = sum(len(value) for value in self.information.values())
+        if self.max_pages is not None and (
+            page.more_follows == MoreData.KEEP_READING
+            and self.pages >= self.max_pages
+        ):
+            self._raise(
+                f"More than {self.max_pages} response pages required.", page
+            )
+        if self.max_bytes is not None and self._total_bytes > self.max_bytes:
+            self._raise(
+                f"Collected {self._total_bytes} object bytes, exceeding the "
+                f"limit of {self.max_bytes}.",
+                page,
+            )
+
+        if page.more_follows == MoreData.NOTHING:
+            if page.next_object_id != 0x00:
+                self._raise(
+                    f"more_follows=nothing but next_object_id is "
+                    f"{page.next_object_id} (expected 0).",
+                    page,
+                )
+            self.next_object_id = 0x00
+            self.complete = True
+            return True
+
+        if not objects or page.next_object_id <= objects[-1][0]:
+            self._raise(
+                f"Invalid next_object_id {page.next_object_id}; the device "
+                f"does not progress past object id "
+                f"{objects[-1][0] if objects else self.next_object_id - 1}.",
+                page,
+            )
+        if page.next_object_id <= self.next_object_id:
+            self._raise(
+                f"next_object_id {page.next_object_id} jumps back to an "
+                f"object id already requested ({self.next_object_id}).",
+                page,
+            )
+        self.next_object_id = page.next_object_id
+        return False
+
+    def build_response(self) -> ReadDeviceInformationResponse:
+        """Build the merged response containing all collected objects."""
+        response = ReadDeviceInformationResponse(
+            read_code=self.read_code,
+            information=dict(self.information),
+        )
+        if self.conformity is not None:
+            response.conformity = self.conformity
+        response.number_of_objects = len(self.information)
+        response.more_follows = MoreData.NOTHING
+        response.next_object_id = 0x00
+        return response
 
 
 DecodePDU.add_pdu(_EncapsulatedInterfaceTransport, _EncapsulatedInterfaceTransport)

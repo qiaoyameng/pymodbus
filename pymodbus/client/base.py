@@ -5,10 +5,12 @@ from __future__ import annotations
 from abc import abstractmethod
 from collections.abc import Awaitable, Callable
 
+from ..constants import DeviceInformation
 from ..exceptions import ConnectionException
 from ..framer import FRAMER_NAME_TO_CLASS, FramerBase, FramerType
 from ..logging import Log
 from ..pdu import DecodePDU, ModbusPDU
+from ..pdu.mei_message import DeviceInformationCollector, ReadDeviceInformationRequest, ReadDeviceInformationResponse
 from ..transaction import TransactionManager
 from ..transport import CommParams
 from .mixin import ModbusClientMixin
@@ -98,6 +100,44 @@ class ModbusBaseClient(ModbusClientMixin[Awaitable[ModbusPDU]]):
             When a request is successful the count is reset.
         """
         self.ctx.max_until_disconnect = max_count
+
+    async def read_device_information_full(
+        self,
+        *,
+        read_code: int = DeviceInformation.BASIC,
+        device_id: int = 1,
+        max_pages: int | None = None,
+        max_bytes: int | None = None,
+    ) -> ReadDeviceInformationResponse:
+        """Read all identification objects for a read code (code 0x2B sub 0x0E).
+
+        Follows the ``next_object_id`` / ``more_follows`` paging automatically,
+        so the caller does not have to implement the paging loop.
+
+        :param read_code: The device information read code (basic/regular/extended)
+        :param device_id: (optional) Modbus device ID
+        :param max_pages: (optional) Maximum number of pages to accept
+        :param max_bytes: (optional) Maximum total object bytes to accept
+        :returns: A merged response with all objects as raw bytes
+        :raises DeviceInformationException: Inconsistent pages, duplicate
+                  objects with different content, a device that repeats a page
+                  or jumps backwards, or when a limit is exceeded. The
+                  exception carries the collected objects and failing page.
+        """
+        collector = DeviceInformationCollector(
+            read_code, max_pages=max_pages, max_bytes=max_bytes
+        )
+        while True:
+            response = await self.execute(
+                False,
+                ReadDeviceInformationRequest(
+                    read_code=read_code,
+                    object_id=collector.next_object_id,
+                    dev_id=device_id,
+                ),
+            )
+            if collector.add_page(response):
+                return collector.build_response()
 
     async def __aenter__(self):
         """Implement the client with enter block.
@@ -199,6 +239,44 @@ class ModbusBaseSyncClient(ModbusClientMixin[ModbusPDU]):
             When a request is successful the count is reset.
         """
         self.transaction.max_until_disconnect = max_count
+
+    def read_device_information_full(
+        self,
+        *,
+        read_code: int = DeviceInformation.BASIC,
+        device_id: int = 1,
+        max_pages: int | None = None,
+        max_bytes: int | None = None,
+    ) -> ReadDeviceInformationResponse:
+        """Read all identification objects for a read code (code 0x2B sub 0x0E).
+
+        Follows the ``next_object_id`` / ``more_follows`` paging automatically,
+        so the caller does not have to implement the paging loop.
+
+        :param read_code: The device information read code (basic/regular/extended)
+        :param device_id: (optional) Modbus device ID
+        :param max_pages: (optional) Maximum number of pages to accept
+        :param max_bytes: (optional) Maximum total object bytes to accept
+        :returns: A merged response with all objects as raw bytes
+        :raises DeviceInformationException: Inconsistent pages, duplicate
+                  objects with different content, a device that repeats a
+                  page or jumps backwards, or when a limit is exceeded. The
+                  exception carries the collected objects and failing page.
+        """
+        collector = DeviceInformationCollector(
+            read_code, max_pages=max_pages, max_bytes=max_bytes
+        )
+        while True:
+            response = self.execute(
+                False,
+                ReadDeviceInformationRequest(
+                    read_code=read_code,
+                    object_id=collector.next_object_id,
+                    dev_id=device_id,
+                ),
+            )
+            if collector.add_page(response):
+                return collector.build_response()
 
     # ----------------------------------------------------------------------- #
     # Internal methods

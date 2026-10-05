@@ -188,6 +188,9 @@ def execute_information_requests(client):
     assert not rr.isError()  # test that call was OK
     assert rr.information[0] == b"Pymodbus"
 
+    rr = client.read_device_information_full(device_id=DEVICE_ID, read_code=1)
+    assert rr.information[0] == b"Pymodbus"
+
     rr = client.report_device_id(device_id=DEVICE_ID)
     assert not rr.isError()  # test that call was OK
     assert rr.status
