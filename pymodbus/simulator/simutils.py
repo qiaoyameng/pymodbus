@@ -70,6 +70,8 @@ class SimUtils:
 
     RunTimeFlag_TYPE = 2**4 - 1  # Isolate number of registers
     RunTimeFlag_READONLY = 2**4  # only read is allowed
+    RunTimeFlag_CLEAR_ON_READ = 2**5
+    RunTimeFlag_LATCH_ON_READ = 2**6
 
     def __init__(self):
         """Ensure that class is not instantiated."""

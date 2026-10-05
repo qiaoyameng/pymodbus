@@ -429,6 +429,32 @@ class TestSimDevice:
         lists = sd.build_device()
         assert lists == result
 
+    def test_simdevice_read_access_flags(self):
+        """Read-clear and read-latch flags can be combined."""
+        device = SimDevice(
+            id=0,
+            simdata=[
+                SimData(
+                    0,
+                    values=1,
+                    datatype=DataType.REGISTERS,
+                    clear_on_read=True,
+                    latch_on_read=True,
+                )
+            ],
+        )
+
+        start, registers, flags = cast(SimRegs, device.build_device())
+
+        assert start == 0
+        assert registers == [1, 0]
+        assert flags[0] == (
+            DataType.REGISTERS
+            | SimUtils.RunTimeFlag_CLEAR_ON_READ
+            | SimUtils.RunTimeFlag_LATCH_ON_READ
+        )
+        assert flags[1] == DataType.INVALID
+
     @pytest.mark.parametrize(
         ("block", "registers", "addr"),
         [

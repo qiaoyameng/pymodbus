@@ -107,7 +107,12 @@ class ModbusBaseServer(ModbusProtocol):
         raise RuntimeError("callback_data should never be called")
 
     async def async_getValues(
-        self, device_id: int, func_code: int, address: int, count: int = 1
+        self,
+        device_id: int,
+        func_code: int,
+        address: int,
+        count: int = 1,
+        transaction: bool = False,
     ) -> list[int] | list[bool]:
         """Get `count` values from datastore.
 
@@ -117,7 +122,9 @@ class ModbusBaseServer(ModbusProtocol):
         :param count: The number of values to retrieve
         :returns: The requested values from a:a+c
         """
-        res = await self.context.async_getValues(device_id, func_code, address, count)
+        res = await self.context.async_getValues(
+            device_id, func_code, address, count, transaction
+        )
         if not isinstance(res, list):
             raise TypeError("Illegal external call to server.async_getValues")
         return res

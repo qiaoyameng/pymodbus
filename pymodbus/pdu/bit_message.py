@@ -8,6 +8,7 @@ from ..datastore import ModbusServerContext
 from .decoders import DecodePDU
 from .exceptionresponse import ExceptionResponse
 from .pdu import ModbusPDU
+from .read_transaction import read_datastore
 from .utils import pack_bitstring, unpack_bitstring
 
 
@@ -33,18 +34,20 @@ class ReadCoilsRequest(ModbusPDU):
         self, context: ModbusServerContext, device_id: int
     ) -> ModbusPDU:
         """Run request against a datastore."""
-        values = await context.async_getValues(
-            device_id, self.function_code, self.address, self.count
-        )
-        if isinstance(values, ExcCodes):
-            return ExceptionResponse(self.function_code, values)
         response_class = (
             ReadCoilsResponse if self.function_code == 1 else ReadDiscreteInputsResponse
         )
-        return response_class(
-            dev_id=self.dev_id,
-            transaction_id=self.transaction_id,
-            bits=cast(list[bool], values),
+        return await read_datastore(
+            context,
+            device_id,
+            self.function_code,
+            self.address,
+            self.count,
+            lambda values: response_class(
+                dev_id=self.dev_id,
+                transaction_id=self.transaction_id,
+                bits=cast(list[bool], values),
+            ),
         )
 
 

@@ -137,7 +137,12 @@ class ModbusServerContext:
         )
 
     async def async_getValues(
-        self, device_id: int, func_code: int, address: int, count: int = 1
+        self,
+        device_id: int,
+        func_code: int,
+        address: int,
+        count: int = 1,
+        transaction: bool = False,
     ) -> list[int] | list[bool] | ExcCodes:
         """Get `count` values from datastore.
 
@@ -149,6 +154,7 @@ class ModbusServerContext:
         """
         dev = self.__get_device(device_id)
         if isinstance(dev, ModbusSimulatorContext):
+            _ = transaction
             return await dev.async_OLD_getValues(func_code, address, count)
         return ExcCodes.DEVICE_BUSY
 

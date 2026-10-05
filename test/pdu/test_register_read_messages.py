@@ -238,6 +238,35 @@ class TestReadRegisterMessages:
         ):
             await pdu.datastore_update(context, 1)
 
+    async def test_register_read_failed_response_rolls_back(self):
+        """A response construction failure must not commit a read-clear snapshot."""
+        from pymodbus.simulator import DataType, SimData, SimDevice
+        from pymodbus.simulator.simcore import SimCore
+
+        context = SimCore(
+            SimDevice(
+                0,
+                simdata=[
+                    SimData(
+                        0,
+                        values=0x00010002,
+                        clear_on_read=True,
+                        datatype=DataType.UINT32,
+                    )
+                ],
+            )
+        )
+        request = ReadHoldingRegistersRequest(address=0, count=2)
+
+        with mock.patch(
+            "pymodbus.pdu.register_message.ReadHoldingRegistersResponse",
+            side_effect=RuntimeError("response construction failed"),
+        ):
+            with pytest.raises(RuntimeError, match="response construction failed"):
+                await request.datastore_update(context, 0)
+
+        assert context.devices[0].block["x"][2][:2] == [1, 2]
+
     def test_serializing_to_string(self):
         """Test serializing to string."""
         for request in iter(self.request_read.keys()):

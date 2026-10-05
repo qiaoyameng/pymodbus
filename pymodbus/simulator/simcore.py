@@ -43,11 +43,16 @@ class SimCore:
         return dev_ids
 
     async def async_getValues(
-        self, device_id: int, func_code: int, address: int, count: int = 1
+        self,
+        device_id: int,
+        func_code: int,
+        address: int,
+        count: int = 1,
+        transaction: bool = False,
     ) -> list[int] | list[bool] | ExcCodes:
         """Get `count` values from datastore."""
         return await self.__get_device(device_id).async_getValues(
-            func_code, address, count
+            func_code, address, count, transaction
         )
 
     async def async_setValues(

@@ -12,6 +12,7 @@ from ..exceptions import ModbusIOException
 from .decoders import DecodePDU
 from .exceptionresponse import ExceptionResponse
 from .pdu import ModbusPDU
+from .read_transaction import read_datastore
 
 
 class ReadHoldingRegistersRequest(ModbusPDU):
@@ -36,20 +37,22 @@ class ReadHoldingRegistersRequest(ModbusPDU):
         self, context: ModbusServerContext, device_id: int
     ) -> ModbusPDU:
         """Update diagnostic request on the given device."""
-        values = await context.async_getValues(
-            device_id, self.function_code, self.address, self.count
-        )
-        if isinstance(values, ExcCodes):
-            return ExceptionResponse(self.function_code, values)
         response_class = (
             ReadHoldingRegistersResponse
             if self.function_code == 3
             else ReadInputRegistersResponse
         )
-        return response_class(
-            registers=cast(list[int], values),
-            dev_id=device_id,
-            transaction_id=self.transaction_id,
+        return await read_datastore(
+            context,
+            device_id,
+            self.function_code,
+            self.address,
+            self.count,
+            lambda values: response_class(
+                registers=cast(list[int], values),
+                dev_id=device_id,
+                transaction_id=self.transaction_id,
+            ),
         )
 
 
@@ -172,15 +175,17 @@ class ReadWriteMultipleRegistersRequest(ModbusPDU):
         )
         if rc:
             return ExceptionResponse(self.function_code, rc)
-        registers = await context.async_getValues(
-            device_id, self.function_code, self.read_address, self.read_count
-        )
-        if isinstance(registers, ExcCodes):
-            return ExceptionResponse(self.function_code, registers)
-        return ReadWriteMultipleRegistersResponse(
-            registers=cast(list[int], registers),
-            dev_id=device_id,
-            transaction_id=self.transaction_id,
+        return await read_datastore(
+            context,
+            device_id,
+            self.function_code,
+            self.read_address,
+            self.read_count,
+            lambda registers: ReadWriteMultipleRegistersResponse(
+                registers=cast(list[int], registers),
+                dev_id=device_id,
+                transaction_id=self.transaction_id,
+            ),
         )
 
 

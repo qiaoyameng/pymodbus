@@ -1,10 +1,14 @@
 """Test SimCore."""
 
+import asyncio
+
 import pytest
 
+from pymodbus.pdu.register_message import ReadHoldingRegistersRequest
 from pymodbus.constants import ExcCodes
 from pymodbus.simulator import DataType, SimData, SimDevice
 from pymodbus.simulator.simruntime import SimRuntime
+from pymodbus.simulator.simcore import SimCore
 
 
 class TestSimRuntime:
@@ -164,3 +168,223 @@ class TestSimRuntime:
         assert result2 == [1]
         result3 = await rt.async_setValues(0x03, 15, [1])
         assert isinstance(result3, ExcCodes)
+
+    async def test_simruntime_clear_on_read_range(self):
+        """Only configured groups hit by a request are cleared after reading."""
+        device = SimDevice(
+            0,
+            simdata=[
+                SimData(0, values=10, datatype=DataType.REGISTERS),
+                SimData(
+                    1,
+                    values=0x000B000C,
+                    clear_on_read=True,
+                    datatype=DataType.UINT32,
+                ),
+                SimData(3, values=13, datatype=DataType.REGISTERS),
+            ],
+        )
+        runtime = SimRuntime(device)
+
+        assert await runtime.async_getValues(0x03, 0, 1) == [10]
+        assert runtime.block["x"][2] == [10, 11, 12, 13, 0]
+
+        assert await runtime.async_getValues(0x03, 3, 1) == [13]
+        assert runtime.block["x"][2] == [10, 11, 12, 13, 0]
+
+        assert await runtime.async_getValues(0x03, 1, 1) == [11]
+        assert runtime.block["x"][2] == [10, 0, 0, 13, 0]
+
+        assert await runtime.async_getValues(0x03, 2, 2) == [0, 13]
+        assert runtime.block["x"][2] == [10, 0, 0, 13, 0]
+
+    async def test_simruntime_clear_invalid_request(self):
+        """An illegal read must return an exception without clearing alarms."""
+        device = SimDevice(
+            0,
+            simdata=[
+                SimData(
+                    0,
+                    values=0x00010002,
+                    clear_on_read=True,
+                    datatype=DataType.UINT32,
+                ),
+            ],
+        )
+        runtime = SimRuntime(device)
+
+        result = await runtime.async_getValues(0x03, 1, 2)
+
+        assert result == ExcCodes.ILLEGAL_ADDRESS
+        assert runtime.block["x"][2] == [1, 2, 0]
+
+    async def test_simruntime_latch_is_per_request(self):
+        """Each read starts with a fresh snapshot after the previous read commits."""
+        device = SimDevice(
+            0,
+            simdata=[
+                SimData(
+                    0,
+                    values=0x00010002,
+                    latch_on_read=True,
+                    datatype=DataType.UINT32,
+                ),
+                SimData(2, values=3, datatype=DataType.REGISTERS),
+            ],
+        )
+        runtime = SimRuntime(device)
+
+        first = await runtime.async_getValues(0x03, 0, 3)
+        runtime.block["x"][2][0:3] = [4, 5, 6]
+        second = await runtime.async_getValues(0x03, 0, 3)
+
+        assert first == [1, 2, 3]
+        assert second == [4, 5, 6]
+
+    async def test_simruntime_latch_overlapping_and_partial_reads(self):
+        """Overlapping requests and partial field reads use request snapshots."""
+        device = SimDevice(
+            0,
+            simdata=[
+                SimData(
+                    0,
+                    values=0x00010002,
+                    latch_on_read=True,
+                    datatype=DataType.UINT32,
+                ),
+                SimData(2, values=3, datatype=DataType.REGISTERS),
+            ],
+        )
+        runtime = SimRuntime(device)
+
+        first = await runtime.async_getValues(0x03, 0, 2, transaction=True)
+        await first.rollback()
+        runtime.block["x"][2][0:3] = [4, 5, 6]
+        overlapping = await runtime.async_getValues(0x03, 1, 2)
+
+        assert first == [1, 2]
+        assert overlapping == [5, 6]
+
+    async def test_simruntime_wide_snapshot_concurrent_update(self):
+        """A wide counter is read either completely old or completely new."""
+        start = asyncio.Event()
+        barrier_reached = asyncio.Event()
+        release_barrier = asyncio.Event()
+
+        async def barrier():
+            barrier_reached.set()
+            await release_barrier.wait()
+
+        device = SimDevice(
+            0,
+            simdata=[
+                SimData(
+                    0,
+                    values=0x00010002,
+                    latch_on_read=True,
+                    datatype=DataType.UINT32,
+                ),
+            ],
+        )
+        runtime = SimRuntime(device)
+        runtime.snapshot_barrier = barrier
+
+        async def read_counter():
+            return await runtime.async_getValues(0x03, 0, 2, transaction=True)
+
+        async def update_counter():
+            await start.wait()
+            update_task = asyncio.create_task(
+                runtime.async_setValues(0x10, 0, [0x0003, 0x0004])
+            )
+            await asyncio.sleep(0)
+            await barrier_reached.wait()
+            release_barrier.set()
+            return await update_task
+
+        start.set()
+        snapshot, _update = await asyncio.gather(read_counter(), update_counter())
+        assert snapshot in ([1, 2], [3, 4])
+        assert runtime.block["x"][2][:2] == [3, 4]
+        await snapshot.commit()
+
+    async def test_simruntime_clear_after_response_construction(self):
+        """Clear waits until the read response object was constructed."""
+        core = SimCore(
+            SimDevice(
+                0,
+                simdata=[
+                    SimData(
+                        0,
+                        values=0x00010002,
+                        clear_on_read=True,
+                        datatype=DataType.UINT32,
+                    )
+                ],
+            )
+        )
+        request = ReadHoldingRegistersRequest(address=0, count=2)
+
+        response = await request.datastore_update(core, 0)
+
+        assert response.registers == [1, 2]
+        assert core.devices[0].block["x"][2] == [0, 0, 0]
+
+    async def test_simruntime_latch_and_clear_combined(self):
+        """The two read semantics can be used on the same field."""
+        device = SimDevice(
+            0,
+            simdata=[
+                SimData(
+                    0,
+                    values=0x00010002,
+                    clear_on_read=True,
+                    latch_on_read=True,
+                    datatype=DataType.UINT32,
+                )
+            ],
+        )
+        runtime = SimRuntime(device)
+
+        snapshot = await runtime.async_getValues(0x03, 0, 2, transaction=True)
+        runtime.block["x"][2][0:2] = [3, 4]
+
+        assert snapshot == [1, 2]
+        await snapshot.commit()
+        assert runtime.block["x"][2][:3] == [0, 0, 0]
+
+    async def test_simruntime_clear_on_read_bits(self):
+        """Bit clear ranges use bit coordinates and require an actual intersection."""
+        empty_inputs = [SimData(0, count=32, values=False, datatype=DataType.BITS)]
+        registers = [SimData(0, values=10, datatype=DataType.REGISTERS)]
+        coils = [
+            SimData(0, values=False, datatype=DataType.BITS),
+            SimData(
+                1,
+                count=1,
+                values=[
+                    True,
+                    False,
+                    True,
+                    False,
+                    False,
+                    False,
+                ],
+                clear_on_read=True,
+                datatype=DataType.BITS,
+            ),
+            SimData(7, values=[False], datatype=DataType.BITS),
+            SimData(8, values=[False] * 8, datatype=DataType.BITS),
+        ]
+        runtime = SimRuntime(
+            SimDevice(0, simdata=(coils, empty_inputs, registers, registers))
+        )
+
+        assert await runtime.async_getValues(1, 7, 2) == [False, False]
+        assert runtime.block["c"][2] == [0x000A, 0]
+
+        assert await runtime.async_getValues(1, 0, 1) == [False]
+        assert runtime.block["c"][2] == [0x000A, 0]
+
+        assert await runtime.async_getValues(1, 3, 1) == [True]
+        assert runtime.block["c"][2] == [0, 0]

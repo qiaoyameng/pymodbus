@@ -102,6 +102,12 @@ class SimData:
 
     In non-shared mode (coil and discrete inputs requests)
         - address refers to the bit.
+
+    Read access semantics can be enabled independently or together:
+        - clear_on_read clears the complete field after a successful read,
+          but only when the request intersects the field's configured range.
+        - latch_on_read returns the field from the snapshot taken by the
+          current request; the next request takes a new snapshot.
     """
 
     #: Address of first register, starting with 0 (identical to the requests)
@@ -136,6 +142,12 @@ class SimData:
     #: Mark register(s) as readonly.
     readonly: bool = False
 
+    #: Clear the complete configured field after a successful read that touches it.
+    clear_on_read: bool = False
+
+    #: Read the field from the snapshot taken for the current read request.
+    latch_on_read: bool = False
+
     def __check_simple(self):
         """Check simple parameters."""
         if not isinstance(self.address, int) or not 0 <= self.address <= 65535:
@@ -154,6 +166,12 @@ class SimData:
             "test string".encode(self.string_encoding)
         except (UnicodeEncodeError, LookupError) as exc:
             raise TypeError("string_encoding= not valid") from exc
+        if not isinstance(self.readonly, bool):
+            raise TypeError("readonly= must be a bool")
+        if not isinstance(self.clear_on_read, bool):
+            raise TypeError("clear_on_read= must be a bool")
+        if not isinstance(self.latch_on_read, bool):
+            raise TypeError("latch_on_read= must be a bool")
 
     def __check_parameters(self):
         """Check all parameters."""

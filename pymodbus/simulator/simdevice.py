@@ -18,6 +18,7 @@ SimAction: TypeAlias = Callable[
     Coroutine[None, None, ExcCodes | None],
 ]
 SimRegs: TypeAlias = tuple[int, list[int], list[int]]
+SimReadGroups: TypeAlias = dict[str, list[tuple[int, int]]]
 TUPLE_NAMES = ("coils", "discrete inputs", "holding registers", "input registers")
 
 
@@ -205,6 +206,10 @@ class SimDevice:
         flag_normal: int = simdata.datatype
         if simdata.readonly:
             flag_normal |= SimUtils.RunTimeFlag_READONLY
+        if simdata.clear_on_read:
+            flag_normal |= SimUtils.RunTimeFlag_CLEAR_ON_READ
+        if simdata.latch_on_read:
+            flag_normal |= SimUtils.RunTimeFlag_LATCH_ON_READ
         return flag_normal
 
     def __create_simdata(
@@ -287,3 +292,48 @@ class SimDevice:
             else:
                 b[convert[i]] = self.__create_block(x_simdata)
         return b
+
+    def build_read_groups(self) -> SimReadGroups:
+        """Build configured register groups cleared after successful reads."""
+        self.__check_parameters()
+        groups: SimReadGroups = {}
+        if not isinstance(self.simdata, tuple):
+            x_simdata = (
+                self.simdata if isinstance(self.simdata, list) else [self.simdata]
+            )
+            x_simdata.sort(key=lambda x: x.address)
+            groups["x"] = [
+                (
+                    entry.address,
+                    len(entry.build_registers(False)) * entry.count,
+                )
+                for entry in x_simdata
+                if entry.clear_on_read
+            ]
+            return groups
+
+        convert = {0: "c", 1: "d", 2: "h", 3: "i"}
+        for i in range(4):
+            x_simdata = list(self.simdata[i])
+            x_simdata.sort(key=lambda x: x.address)
+            if i < 2:
+                block_start = x_simdata[0].address - x_simdata[0].address % 16
+                groups[convert[i]] = [
+                    (
+                        entry.address - block_start,
+                        len(cast(list[bool], entry.build_registers(True)))
+                        * entry.count,
+                    )
+                    for entry in x_simdata
+                    if entry.clear_on_read
+                ]
+            else:
+                groups[convert[i]] = [
+                    (
+                        entry.address,
+                        len(entry.build_registers(False)) * entry.count,
+                    )
+                    for entry in x_simdata
+                    if entry.clear_on_read
+                ]
+        return groups
