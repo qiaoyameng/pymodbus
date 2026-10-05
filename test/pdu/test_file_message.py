@@ -9,6 +9,7 @@ bit based request/response messages:
 
 import pytest
 
+from pymodbus.constants import ExcCodes
 from pymodbus.exceptions import ModbusException
 from pymodbus.pdu.file_message import (
     FileRecord,
@@ -19,6 +20,7 @@ from pymodbus.pdu.file_message import (
     WriteFileRecordRequest,
     WriteFileRecordResponse,
 )
+from pymodbus.pdu.exceptionresponse import ExceptionResponse
 
 
 TEST_MESSAGE = b"\x00\n\x00\x04\x00\x01\x00\x02\x00\x03\x00\x04"
@@ -188,6 +190,143 @@ class TestBitMessage:
         handle = WriteFileRecordRequest()
         result = await handle.datastore_update(mock_server_context(), 0)
         assert isinstance(result, WriteFileRecordResponse)
+
+    async def test_write_then_read_two_files(self, mock_server_context):
+        """Test writing two files in one request and reading them back."""
+        context = mock_server_context()
+        handle = WriteFileRecordRequest(
+            records=[
+                FileRecord(
+                    file_number=0x01,
+                    record_number=0x00,
+                    record_data=b"\x00\x0a\x00\x0b",
+                ),
+                FileRecord(
+                    file_number=0x02,
+                    record_number=0x05,
+                    record_data=b"\x00\x0c",
+                ),
+            ]
+        )
+        result = await handle.datastore_update(context, 3)
+        assert isinstance(result, WriteFileRecordResponse)
+        assert result.encode() == handle.encode()
+
+        read = ReadFileRecordRequest(
+            records=[
+                FileRecord(file_number=0x01, record_number=0x00, record_length=4),
+                FileRecord(file_number=0x02, record_number=0x05, record_length=2),
+            ]
+        )
+        result = await read.datastore_update(context, 3)
+        assert isinstance(result, ReadFileRecordResponse)
+        assert result.records[0].record_data == b"\x00\x0a\x00\x0b"
+        assert result.records[1].record_data == b"\x00\x0c"
+        # byte count is computed from actual response data
+        assert result.encode()[0] == len(result.encode()) - 1 == 10
+
+        # registers are isolated per device
+        result = await read.datastore_update(context, 4)
+        assert result.records[0].record_data == b"\x00\x00" * 2
+        assert result.records[1].record_data == b"\x00\x00"
+
+    async def test_write_atomic_when_last_record_invalid(self, mock_server_context):
+        """Test that an invalid last sub record leaves earlier data untouched."""
+        context = mock_server_context()
+        handle = WriteFileRecordRequest(
+            records=[
+                FileRecord(
+                    file_number=0x01,
+                    record_number=0x00,
+                    record_data=b"\xaa\xaa",
+                )
+            ]
+        )
+        result = await handle.datastore_update(context, 0)
+        assert isinstance(result, WriteFileRecordResponse)
+
+        handle = WriteFileRecordRequest(
+            records=[
+                FileRecord(
+                    file_number=0x01,
+                    record_number=0x00,
+                    record_data=b"\xbb\xbb",
+                ),
+                FileRecord(
+                    file_number=0x01,
+                    record_number=0x270F,
+                    record_data=b"\x00\x01\x00\x02",
+                ),
+            ]
+        )
+        result = await handle.datastore_update(context, 0)
+        assert isinstance(result, ExceptionResponse)
+        assert result.exception_code == ExcCodes.ILLEGAL_ADDRESS
+
+        read = ReadFileRecordRequest(
+            records=[FileRecord(file_number=0x01, record_number=0x00, record_length=2)]
+        )
+        result = await read.datastore_update(context, 0)
+        assert isinstance(result, ReadFileRecordResponse)
+        assert result.records[0].record_data == b"\xaa\xaa"
+
+    async def test_write_overlapping_records_rejected(self, mock_server_context):
+        """Test that overlapping write regions in one request are rejected."""
+        context = mock_server_context()
+        handle = WriteFileRecordRequest(
+            records=[
+                FileRecord(
+                    file_number=0x01,
+                    record_number=0x00,
+                    record_data=b"\x00\x01\x00\x02",
+                ),
+                FileRecord(
+                    file_number=0x01,
+                    record_number=0x01,
+                    record_data=b"\x00\x03",
+                ),
+            ]
+        )
+        result = await handle.datastore_update(context, 0)
+        assert isinstance(result, ExceptionResponse)
+        assert result.exception_code == ExcCodes.ILLEGAL_VALUE
+
+        # adjacent but non-overlapping regions are accepted
+        handle = WriteFileRecordRequest(
+            records=[
+                FileRecord(
+                    file_number=0x01,
+                    record_number=0x00,
+                    record_data=b"\x00\x01\x00\x02",
+                ),
+                FileRecord(
+                    file_number=0x01,
+                    record_number=0x02,
+                    record_data=b"\x00\x03",
+                ),
+            ]
+        )
+        result = await handle.datastore_update(context, 0)
+        assert isinstance(result, WriteFileRecordResponse)
+
+    async def test_write_bad_reference_type(self, mock_server_context):
+        """Test that a non 0x06 reference type is rejected."""
+        handle = WriteFileRecordRequest()
+        handle.decode(b"\x09\x05\x00\x01\x00\x00\x00\x01\x00\x01")
+        result = await handle.datastore_update(mock_server_context(), 0)
+        assert isinstance(result, ExceptionResponse)
+        assert result.exception_code == ExcCodes.ILLEGAL_VALUE
+
+    async def test_read_out_of_bounds(self, mock_server_context):
+        """Test that reads beyond the record boundary are rejected."""
+        handle = ReadFileRecordRequest(
+            records=[
+                FileRecord(file_number=0x01, record_number=0x270F, record_length=4)
+            ]
+        )
+        result = await handle.datastore_update(mock_server_context(), 0)
+        assert isinstance(result, ExceptionResponse)
+        assert result.exception_code == ExcCodes.ILLEGAL_ADDRESS
 
     # -----------------------------------------------------------------------#
     #  Write File Record Response

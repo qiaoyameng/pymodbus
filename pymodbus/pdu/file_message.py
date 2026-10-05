@@ -5,9 +5,11 @@ from __future__ import annotations
 import struct
 from dataclasses import dataclass
 
+from ..constants import ExcCodes
 from ..datastore import ModbusServerContext
 from ..exceptions import ModbusException
 from .decoders import DecodePDU
+from .exceptionresponse import ExceptionResponse
 from .pdu import ModbusPDU
 
 
@@ -15,6 +17,7 @@ from .pdu import ModbusPDU
 class FileRecord:
     """Represents a file record and its relevant data."""
 
+    reference_type: int = 0x06
     file_number: int = 0
     record_number: int = 0
     record_data: bytes = b""
@@ -53,7 +56,7 @@ class ReadFileRecordRequest(ModbusPDU):
         for record in self.records:
             packet += struct.pack(
                 ">BHHH",
-                0x06,
+                record.reference_type,
                 record.file_number,
                 record.record_number,
                 record.record_length,
@@ -68,6 +71,7 @@ class ReadFileRecordRequest(ModbusPDU):
         for count in range(1, byte_count, 7):
             decoded = struct.unpack(">BHHH", data[count : count + 7])
             record = FileRecord(
+                reference_type=decoded[0],
                 file_number=decoded[1],
                 record_number=decoded[2],
                 record_length=decoded[3],
@@ -78,12 +82,35 @@ class ReadFileRecordRequest(ModbusPDU):
         self, context: ModbusServerContext, device_id: int
     ) -> ModbusPDU:
         """Update diagnostic request on the given device."""
-        _ = context
+        store = context.file_records
         for record in self.records:
-            record.record_data = b"SERVER DUMMY RECORD."
-            record.record_length = len(record.record_data) // 2
+            if record.reference_type != 0x06:
+                return ExceptionResponse(self.function_code, ExcCodes.ILLEGAL_VALUE)
+            if exc := store.validate(
+                record.file_number, record.record_number, record.record_length
+            ):
+                return ExceptionResponse(self.function_code, exc)
+        response_records = []
+        for record in self.records:
+            values = store.read(
+                device_id,
+                record.file_number,
+                record.record_number,
+                record.record_length,
+            )
+            response_records.append(
+                FileRecord(
+                    file_number=record.file_number,
+                    record_number=record.record_number,
+                    record_data=struct.pack(
+                        f">{record.record_length}H", *values
+                    ),
+                )
+            )
         return ReadFileRecordResponse(
-            records=self.records, dev_id=device_id, transaction_id=self.transaction_id
+            records=response_records,
+            dev_id=device_id,
+            transaction_id=self.transaction_id,
         )
 
 
@@ -153,7 +180,7 @@ class WriteFileRecordRequest(ModbusPDU):
         for record in self.records:
             packet += struct.pack(
                 ">BHHH",
-                0x06,
+                record.reference_type,
                 record.file_number,
                 record.record_number,
                 record.record_length,
@@ -172,6 +199,7 @@ class WriteFileRecordRequest(ModbusPDU):
             calc_length = decoded[3] * 2
             count += calc_length + 7
             record = FileRecord(
+                reference_type=decoded[0],
                 file_number=decoded[1],
                 record_number=decoded[2],
                 record_data=data[count - calc_length : count],
@@ -183,7 +211,34 @@ class WriteFileRecordRequest(ModbusPDU):
         self, context: ModbusServerContext, device_id: int
     ) -> ModbusPDU:
         """Update diagnostic request on the given device."""
-        _ = context
+        store = context.file_records
+        spans: dict[int, list[tuple[int, int]]] = {}
+        for record in self.records:
+            if record.reference_type != 0x06:
+                return ExceptionResponse(self.function_code, ExcCodes.ILLEGAL_VALUE)
+            if len(record.record_data) != record.record_length * 2:
+                return ExceptionResponse(self.function_code, ExcCodes.ILLEGAL_VALUE)
+            if exc := store.validate(
+                record.file_number, record.record_number, record.record_length
+            ):
+                return ExceptionResponse(self.function_code, exc)
+            spans.setdefault(record.file_number, []).append(
+                (record.record_number, record.record_number + record.record_length)
+            )
+        for file_spans in spans.values():
+            file_spans.sort()
+            for previous, current in zip(file_spans, file_spans[1:]):
+                if current[0] < previous[1]:
+                    return ExceptionResponse(
+                        self.function_code, ExcCodes.ILLEGAL_VALUE
+                    )
+        for record in self.records:
+            values = list(
+                struct.unpack(f">{record.record_length}H", record.record_data)
+            )
+            store.write(
+                device_id, record.file_number, record.record_number, values
+            )
         return WriteFileRecordResponse(
             records=self.records, dev_id=device_id, transaction_id=self.transaction_id
         )
@@ -212,7 +267,7 @@ class WriteFileRecordResponse(ModbusPDU):
         for record in self.records:
             packet += struct.pack(
                 ">BHHH",
-                0x06,
+                record.reference_type,
                 record.file_number,
                 record.record_number,
                 record.record_length,
@@ -230,6 +285,7 @@ class WriteFileRecordResponse(ModbusPDU):
             calc_length = decoded[3] * 2
             count += calc_length + 7
             record = FileRecord(
+                reference_type=decoded[0],
                 file_number=decoded[1],
                 record_number=decoded[2],
                 record_data=data[count - calc_length : count],

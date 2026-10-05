@@ -10,6 +10,7 @@ from ..logging import Log
 from ..simulator.simdata import DataType
 from ..simulator.simdevice import SimDevice
 from .sequential import ModbusSequentialDataBlock
+from .filerecord import ModbusFileRecordStore
 from .simulator import ModbusSimulatorContext
 from .sparse import ModbusSparseDataBlock
 
@@ -100,6 +101,7 @@ class ModbusServerContext:
         if not devices:
             raise TypeError("devices= cannot be None")
         self.old_simulator = False
+        self.file_records = ModbusFileRecordStore()
         self._devices: dict[int, ModbusDeviceContext | ModbusSimulatorContext]
         self.simdevices: list[SimDevice] = []
         if isinstance(devices, dict):
