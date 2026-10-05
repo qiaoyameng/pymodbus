@@ -46,7 +46,10 @@ class _EncapsulatedInterfaceTransport(ModbusPDU):
         self.sub_function_code = int(data[0])
 
     async def datastore_update(
-        self, context: ModbusServerContext, device_id: int
+        self,
+        context: ModbusServerContext,
+        device_id: int,
+        diagnostic=None,
     ) -> ModbusPDU:
         """Reject unsupported MEI types."""
         _ = context, device_id
@@ -91,7 +94,10 @@ class ReadDeviceInformationRequest(ModbusPDU):
         )
 
     async def datastore_update(
-        self, context: ModbusServerContext, device_id: int
+        self,
+        context: ModbusServerContext,
+        device_id: int,
+        diagnostic=None,
     ) -> ModbusPDU:
         """Update diagnostic request on the given device."""
         _ = context

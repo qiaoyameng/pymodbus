@@ -72,6 +72,8 @@ class FramerAscii(FramerBase):
                 return data_len, dev_id, 0, self.EMPTY
             if not self.check_LRC(msg, lrc):
                 Log.debug("LRC wrong in frame: {} skipping", data, ":hex")
+                if self.checksum_error_callback:
+                    self.checksum_error_callback(dev_id)
                 continue
             return used_len, dev_id, 0, msg[1:]
 

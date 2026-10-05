@@ -36,6 +36,10 @@ class FramerBase:
     ) -> None:
         """Initialize a ADU (framer) instance."""
         self.decoder = decoder
+        # Called with the device id when a frame fails its CRC/LRC check.
+        # Used by the server to update the bus communication error counter;
+        # clients leave it unset and simply drop the bad frame.
+        self.checksum_error_callback = None
 
     def decode(self, _data: bytes) -> tuple[int, int, int, bytes]:
         """Decode ADU.

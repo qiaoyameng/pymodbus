@@ -9,6 +9,10 @@ from ..constants import ExcCodes
 from ..exceptions import ModbusIOException, NoSuchIdException
 from ..logging import Log
 from ..pdu import ExceptionResponse
+from ..pdu.diag_message import (
+    ForceListenOnlyModeRequest,
+    RestartCommunicationsOptionRequest,
+)
 from ..transaction import TransactionManager
 from ..transport import CommParams
 
@@ -40,6 +44,11 @@ class ServerRequestHandler(TransactionManager):
             trace_pdu,
             trace_connect,
         )
+        self.framer.checksum_error_callback = self._handle_checksum_error
+
+    def _handle_checksum_error(self, _dev_id: int) -> None:
+        """Count a frame rejected by the CRC/LRC check (bus level)."""
+        self.server.diagnostics.bus_communication_error()
 
     def callback_disconnected(self, exc: Exception | None) -> None:
         """Call when connection is lost."""
@@ -61,6 +70,10 @@ class ServerRequestHandler(TransactionManager):
         try:
             used_len = super().callback_data(data, addr)
         except ModbusIOException as exc:
+            # Undecodable but framed (checksum valid) messages are still
+            # messages detected on the bus; an illegal function response is
+            # returned so the master is informed.
+            self.server.diagnostics.bus_message()
             function_code = 0x00 if exc.fcode is None else exc.fcode
             response = ExceptionResponse(
                 function_code,
@@ -68,9 +81,22 @@ class ServerRequestHandler(TransactionManager):
                 device_id=exc.dev_id,
                 transaction=exc.transaction_id,
             )
+            if self.server.broadcast_enable and not exc.dev_id:
+                # Broadcast frames never produce a response.
+                return len(data)
+            if exc.dev_id:
+                self.server.diagnostics.device_message(exc.dev_id)
+                if not self.server.diagnostics.is_listen_only(exc.dev_id):
+                    self.server.diagnostics.device_exception(exc.dev_id)
+                    self.server_send(response, addr)
+                    return len(data)
+                self.server.diagnostics.device_no_response(exc.dev_id)
+                return len(data)
             self.server_send(response, addr)
             return len(data)
         if self.last_pdu:
+            # A complete frame with a valid checksum was detected on the bus.
+            self.server.diagnostics.bus_message()
             self.loop.call_soon(self.handle_later)
         return used_len
 
@@ -82,26 +108,50 @@ class ServerRequestHandler(TransactionManager):
         """Handle request."""
         if not self.last_pdu:
             return
+        request = self.last_pdu
+        diagnostics = self.server.diagnostics
+        is_broadcast = bool(self.server.broadcast_enable and not request.dev_id)
+
+        if is_broadcast:
+            # Broadcast frames are executed on every device but never answered.
+            for dev_id in self.server.context.device_ids():
+                diagnostics.device_message(dev_id)
+                diagnostics.device_no_response(dev_id)
+                await request.datastore_update(
+                    self.server.context,
+                    dev_id,
+                    diagnostics,
+                )
+            return
+
+        diagnostics.device_message(request.dev_id)
+
+        # In listen-only mode the device does not respond and does not
+        # process requests, except for the restart communications option
+        # which is the documented way to leave listen-only mode.
+        if diagnostics.is_listen_only(request.dev_id) and not isinstance(
+            request, RestartCommunicationsOptionRequest
+        ):
+            diagnostics.device_no_response(request.dev_id)
+            return
+
         try:
-            if self.server.broadcast_enable and not self.last_pdu.dev_id:
-                # if broadcasting then execute on all device contexts,
-                # note response will be ignored
-                for dev_id in self.server.context.device_ids():
-                    await self.last_pdu.datastore_update(self.server.context, dev_id)
-                return
-            response = await self.last_pdu.datastore_update(
-                self.server.context, self.last_pdu.dev_id
+            response = await request.datastore_update(
+                self.server.context,
+                request.dev_id,
+                diagnostics,
             )
 
         except NoSuchIdException:
             if self.server.ignore_missing_devices:
                 Log.debug(
-                    "ignoring request for unknown device id: {}", self.last_pdu.dev_id
+                    "ignoring request for unknown device id: {}", request.dev_id
                 )
+                diagnostics.device_no_response(request.dev_id)
                 return  # the client will simply timeout waiting for a response
-            Log.error("requested device id does not exist: {}", self.last_pdu.dev_id)
+            Log.error("requested device id does not exist: {}", request.dev_id)
             response = ExceptionResponse(
-                self.last_pdu.function_code, ExcCodes.GATEWAY_NO_RESPONSE
+                request.function_code, ExcCodes.GATEWAY_NO_RESPONSE
             )
         except Exception as exc:  # pylint: disable=broad-except
             Log.error(
@@ -110,10 +160,24 @@ class ServerRequestHandler(TransactionManager):
                 traceback.format_exc(),
             )
             response = ExceptionResponse(
-                self.last_pdu.function_code, ExcCodes.DEVICE_FAILURE
+                request.function_code, ExcCodes.DEVICE_FAILURE
             )
-        response.transaction_id = self.last_pdu.transaction_id
-        response.dev_id = self.last_pdu.dev_id
+        if response is None:
+            diagnostics.device_no_response(request.dev_id)
+            return
+        if response.isError():
+            diagnostics.device_exception(request.dev_id)
+            if response.exception_code == ExcCodes.NEGATIVE_ACKNOWLEDGE:
+                diagnostics.device(request.dev_id).counters.increment("DeviceNAK")
+            elif response.exception_code == ExcCodes.DEVICE_BUSY:
+                diagnostics.device(request.dev_id).counters.increment("DeviceBusy")
+        # Force listen only defines no response; the device goes silent after
+        # accepting the request.
+        if isinstance(request, ForceListenOnlyModeRequest):
+            diagnostics.device_no_response(request.dev_id)
+            return
+        response.transaction_id = request.transaction_id
+        response.dev_id = request.dev_id
         self.server_send(response, self.last_addr)
 
     def server_send(self, pdu, addr):

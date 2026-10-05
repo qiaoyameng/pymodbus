@@ -75,7 +75,10 @@ class ReadFileRecordRequest(ModbusPDU):
             self.records.append(record)
 
     async def datastore_update(
-        self, context: ModbusServerContext, device_id: int
+        self,
+        context: ModbusServerContext,
+        device_id: int,
+        diagnostic=None,
     ) -> ModbusPDU:
         """Update diagnostic request on the given device."""
         _ = context
@@ -180,7 +183,10 @@ class WriteFileRecordRequest(ModbusPDU):
             self.records.append(record)
 
     async def datastore_update(
-        self, context: ModbusServerContext, device_id: int
+        self,
+        context: ModbusServerContext,
+        device_id: int,
+        diagnostic=None,
     ) -> ModbusPDU:
         """Update diagnostic request on the given device."""
         _ = context
@@ -261,7 +267,10 @@ class ReadFifoQueueRequest(ModbusPDU):
         self.address = struct.unpack(">H", data[:2])[0]
 
     async def datastore_update(
-        self, context: ModbusServerContext, device_id: int
+        self,
+        context: ModbusServerContext,
+        device_id: int,
+        diagnostic=None,
     ) -> ModbusPDU:
         """Update diagnostic request on the given device."""
         _ = context

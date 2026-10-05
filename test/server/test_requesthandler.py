@@ -4,9 +4,10 @@ from unittest import mock
 
 import pytest
 
+from pymodbus.constants import ExcCodes
 from pymodbus.exceptions import ModbusIOException, NoSuchIdException
 from pymodbus.framer import FramerType
-from pymodbus.pdu import ExceptionResponse
+from pymodbus.pdu import ExceptionResponse, ReadCoilsRequest
 from pymodbus.server import ModbusBaseServer
 from pymodbus.simulator import DataType, SimData, SimDevice
 from pymodbus.transport import CommParams, CommType
@@ -111,13 +112,21 @@ class TestRequesthandler:
         """Test __init__."""
         requesthandler.last_pdu = None
         await requesthandler.handle_request()
-        requesthandler.last_pdu = ExceptionResponse(17)
+        read_request = ReadCoilsRequest()
+        read_request.datastore_update = mock.AsyncMock(  # type: ignore[method-assign]
+            return_value=ExceptionResponse(17, ExcCodes.ILLEGAL_ADDRESS)
+        )
+        requesthandler.last_pdu = read_request
         await requesthandler.handle_request()
-        requesthandler.last_pdu.datastore_update = mock.AsyncMock()  # type: ignore[method-assign]
+        read_request.datastore_update = mock.AsyncMock()  # type: ignore[method-assign]
         requesthandler.server.broadcast_enable = True
-        requesthandler.last_pdu.dev_id = 0
+        read_request.dev_id = 0
         await requesthandler.handle_request()
-        requesthandler.last_pdu.datastore_update.side_effect = NoSuchIdException
+        requesthandler.server.broadcast_enable = False
+        read_request.dev_id = 1
+        read_request.datastore_update = mock.AsyncMock(  # type: ignore[method-assign]
+            side_effect=NoSuchIdException
+        )
         await requesthandler.handle_request()
         requesthandler.server.ignore_missing_devices = True
         await requesthandler.handle_request()

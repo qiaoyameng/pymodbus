@@ -96,6 +96,8 @@ class FramerRTU(FramerBase):
             crc_val = (int(crc[0]) << 8) + int(crc[1])
             if not FramerRTU.check_CRC(data[used_len:crc_start], crc_val):
                 Log.debug("Frame CRC check failed, possible garbage")
+                if self.checksum_error_callback:
+                    self.checksum_error_callback(dev_id)
                 return data_len, 0, 0, self.EMPTY
             return data_len, dev_id, 0, data[used_len + 1 : crc_start]
         return 0, 0, 0, self.EMPTY

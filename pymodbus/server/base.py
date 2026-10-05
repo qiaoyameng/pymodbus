@@ -11,7 +11,11 @@ from ..exceptions import ParameterException
 from ..framer import FRAMER_NAME_TO_CLASS, FramerType
 from ..logging import Log
 from ..pdu import DecodePDU, ModbusPDU
-from ..pdu.device import ModbusControlBlock, ModbusDeviceIdentification
+from ..pdu.device import (
+    ModbusControlBlock,
+    ModbusDeviceIdentification,
+    ModbusDiagnosticState,
+)
 from ..simulator import SimDevice
 from ..simulator.simcore import SimCore
 from ..transport import CommParams, ModbusProtocol
@@ -55,7 +59,8 @@ class ModbusBaseServer(ModbusProtocol):
             self.context = context
         else:
             raise ParameterException("context= contains unknown object.")
-        self.control = ModbusControlBlock()
+        self.control = ModbusControlBlock(unique=True)
+        self.diagnostics = ModbusDiagnosticState()
         self.ignore_missing_devices = ignore_missing_devices
         self.broadcast_enable = broadcast_enable
         self.trace_packet = trace_packet

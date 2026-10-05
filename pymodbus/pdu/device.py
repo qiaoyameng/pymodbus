@@ -10,7 +10,10 @@ from __future__ import annotations
 
 __all__ = [
     "DeviceInformationFactory",
+    "ModbusDiagnosticState",
+    "ModbusDeviceDiagnostic",
     "ModbusDeviceIdentification",
+    "ModbusCountersHandler",
     "ModbusPlusStatistics",
 ]
 
@@ -362,24 +365,46 @@ class ModbusCountersHandler:
     .. note:: I threw the event counter in here for convenience
     """
 
-    stat_data = dict.fromkeys(range(9), 0x00)
-    __names = [
+    # Every diagnostic counter is an unsigned 16 bit word and wraps
+    # from 0xFFFF back to 0x0000 (MODBUS over Serial Line, diagnostic
+    # counters).
+    COUNTER_MASK = 0xFFFF
+
+    # The counter layout follows the diagnostic sub-functions 0x0B..0x12;
+    # index 8 is the local event counter used by function codes 0x07/0x0B/0x0C.
+    _names = [
         "BusMessage",
         "BusCommunicationError",
-        "DeviceExceptionError",
+        "BusExceptionError",
         "DeviceMessage",
         "DeviceNoResponse",
-        "DeviceeNAK",
-        "DEVICE_BUSY",
+        "DeviceNAK",
+        "DeviceBusy",
         "BusCharacterOverrun",
+        "Event",
     ]
+
+    def __init__(self) -> None:
+        """Initialize all counters to zero."""
+        self.reset()
 
     def __iter__(self):
         """Iterate over the device counters.
 
         :returns: An iterator of the device counters
         """
-        return zip(self.__names, iter(self.stat_data.values()))
+        return zip(self._names, iter(self.stat_data.values()))
+
+    def increment(self, name: str, amount: int = 1) -> int:
+        """Increment a named counter with fixed 16 bit wraparound.
+
+        :param name: Name of the counter property
+        :param amount: Amount to add
+        :returns: The new counter value
+        """
+        value = (getattr(self, name) + amount) & self.COUNTER_MASK
+        setattr(self, name, value)
+        return value
 
     def update(self, values):
         """Update the values of this identity.
@@ -388,11 +413,9 @@ class ModbusCountersHandler:
 
         :param values: The value to copy values from
         """
-        for k, v_item in iter(values.items()):
-            v_item += self.__getattribute__(  # pylint: disable=unnecessary-dunder-call
-                k
-            )
-            self.__setattr__(k, v_item)  # pylint: disable=unnecessary-dunder-call
+        for key, value in iter(values.items()):
+            current = getattr(self, key)
+            setattr(self, key, (current + value) & self.COUNTER_MASK)
 
     def reset(self):
         """Clear all of the system counters."""
@@ -420,30 +443,147 @@ class ModbusCountersHandler:
     DeviceMessage = dict_property(lambda s: s.stat_data, 3)
     DeviceNoResponse = dict_property(lambda s: s.stat_data, 4)
     DeviceNAK = dict_property(lambda s: s.stat_data, 5)
-    DEVICE_BUSY = dict_property(lambda s: s.stat_data, 6)
+    DeviceBusy = dict_property(lambda s: s.stat_data, 6)
     BusCharacterOverrun = dict_property(lambda s: s.stat_data, 7)
     Event = dict_property(lambda s: s.stat_data, 8)
     # fmt: on
+
+    # Backwards compatible alias.
+    DEVICE_BUSY = DeviceBusy
+
+
+# ---------------------------------------------------------------------------#
+#  Per device diagnostic state
+# ---------------------------------------------------------------------------#
+class ModbusDeviceDiagnostic:
+    """Diagnostic state belonging to a single logical device.
+
+    Holds the device scoped counters (sub-functions 0x0D..0x12), the
+    communication event log and the listen-only flag of the device.
+    """
+
+    def __init__(self) -> None:
+        """Initialize the per device diagnostic state."""
+        self.counters = ModbusCountersHandler()
+        self.events: list[ModbusEvent] = []
+        self.listen_only = False
+        self.diagnostic_register = [False] * 16
+
+    def reset_counters(self) -> None:
+        """Clear counters and the communication event log (sub-function 0x0A)."""
+        self.counters.reset()
+        self.events = []
+
+    def add_event(self, event: ModbusEvent) -> None:
+        """Add a new event to the 64 entry event log."""
+        self.events.insert(0, event)
+        del self.events[64:]
+        self.counters.increment("Event")
+
+
+# ---------------------------------------------------------------------------#
+#  Server held diagnostic state
+# ---------------------------------------------------------------------------#
+class ModbusDiagnosticState:
+    """Diagnostic state explicitly held by a server.
+
+    Counters from the Modbus serial line diagnostics are split into:
+
+    * bus level data shared by all logical devices on the transport
+      (bus message count, bus communication error count and bus
+      character overrun count),
+    * device level data kept independently per addressed device.
+
+    Keeping this state on the server instance (rather than in a global
+    singleton) ensures several simulated devices or several servers do
+    not clear each others counters or interfere with listen-only mode.
+    """
+
+    # Counter names shared across the physical bus.
+    BUS_COUNTERS = ("BusMessage", "BusCommunicationError", "BusCharacterOverrun")
+
+    def __init__(self) -> None:
+        """Initialize bus counters and the device state table."""
+        self.bus_counters = ModbusCountersHandler()
+        self.devices: dict[int, ModbusDeviceDiagnostic] = {}
+
+    def device(self, device_id: int) -> ModbusDeviceDiagnostic:
+        """Return (creating on demand) the diagnostic state of a device."""
+        if device_id not in self.devices:
+            self.devices[device_id] = ModbusDeviceDiagnostic()
+        return self.devices[device_id]
+
+    # ---------------------------------------------------------------------#
+    #  Bus level events
+    # ---------------------------------------------------------------------#
+    def bus_message(self) -> None:
+        """Register a valid frame detected on the bus."""
+        self.bus_counters.increment("BusMessage")
+
+    def bus_communication_error(self) -> None:
+        """Register a checksum/framing error detected on the bus."""
+        self.bus_counters.increment("BusCommunicationError")
+
+    # ---------------------------------------------------------------------#
+    #  Device level events
+    # ---------------------------------------------------------------------#
+    def device_message(self, device_id: int) -> None:
+        """Register a valid unicast frame addressed to the device."""
+        self.device(device_id).counters.increment("DeviceMessage")
+
+    def device_exception(self, device_id: int) -> None:
+        """Register an exception response returned for the device."""
+        self.device(device_id).counters.increment("BusExceptionError")
+
+    def device_no_response(self, device_id: int) -> None:
+        """Register an addressed frame that produced no response."""
+        self.device(device_id).counters.increment("DeviceNoResponse")
+
+    def set_listen_only(self, device_id: int) -> None:
+        """Force a single device into listen-only mode."""
+        self.device(device_id).listen_only = True
+
+    def is_listen_only(self, device_id: int) -> bool:
+        """Return the listen-only status of a device."""
+        return self.device(device_id).listen_only
+
+    def restart(self, device_id: int, clear_log: bool) -> None:
+        """Take a device out of listen-only mode.
+
+        :param device_id: Device to restart
+        :param clear_log: Clear event log/counters when True
+        """
+        state = self.device(device_id)
+        state.listen_only = False
+        if clear_log:
+            state.reset_counters()
+            state.diagnostic_register = [False] * 16
+
+    def clear_device_counters(self, device_id: int) -> None:
+        """Clear the counters of one device only."""
+        self.device(device_id).reset_counters()
+
+    def counter_value(self, name: str, device_id: int) -> int:
+        """Read one diagnostic counter.
+
+        Bus level counters are shared, all other counters belong to the
+        addressed device.
+        """
+        if name in self.BUS_COUNTERS:
+            return getattr(self.bus_counters, name)
+        return getattr(self.device(device_id).counters, name)
 
 
 # ---------------------------------------------------------------------------#
 #  Main server control block
 # ---------------------------------------------------------------------------#
 class ModbusControlBlock:
-    """This is a global singleton that controls all system information.
+    """Control block holding the non counter related server state.
 
-    All activity should be logged here and all diagnostic requests
-    should come from here.
+    A server owns its own instance. Diagnostic counters themselves live on
+    :class:`ModbusDiagnosticState`. The class keeps a default singleton so
+    legacy code paths (ASCII delimiter, standalone PDU calls) keep working.
     """
-
-    _mode = "ASCII"
-    _diagnostic = [False] * 16
-    _listen_only = False
-    _delimiter = b"\n"
-    _counters = ModbusCountersHandler()
-    _identity = ModbusDeviceIdentification()
-    _plus = ModbusPlusStatistics()
-    _events: list[ModbusEvent] = []
 
     _inst: ModbusControlBlock | None = None
 
@@ -464,11 +604,31 @@ class ModbusControlBlock:
         """
         return self._counters.__iter__()
 
-    def __new__(cls):
-        """Create a new instance."""
+    def __new__(cls, unique: bool = False):
+        """Create an instance.
+
+        :param unique: Return a server owned instance instead of the
+            process wide default singleton
+        """
+        if unique:
+            instance = object.__new__(cls)
+            instance._init_state()
+            return instance
         if cls._inst is None:
             cls._inst = object.__new__(cls)
+            cls._inst._init_state()
         return cls._inst
+
+    def _init_state(self) -> None:
+        """Initialize mutable instance state."""
+        self._mode = "ASCII"
+        self._diagnostic = [False] * 16
+        self._listen_only = False
+        self._delimiter = b"\n"
+        self._counters = ModbusCountersHandler()
+        self._identity = ModbusDeviceIdentification()
+        self._plus = ModbusPlusStatistics()
+        self._events: list[ModbusEvent] = []
 
     # -------------------------------------------------------------------------#
     #  Events
@@ -479,8 +639,8 @@ class ModbusControlBlock:
         :param event: A new event to add to the log
         """
         self._events.insert(0, event)
-        self._events = self._events[0:64]  # chomp to 64 entries
-        self.Counter.Event += 1
+        del self._events[64:]  # chomp to 64 entries
+        self._counters.increment("Event")
 
     def getEvents(self):
         """Return an encoded collection of the event log.
@@ -503,7 +663,7 @@ class ModbusControlBlock:
     Plus = property(lambda s: s._plus)
 
     def reset(self):
-        """Clear all of the system counters and the diagnostic register."""
+        """Clear the default counters, event log and diagnostic register."""
         self._events = []
         self._counters.reset()
         self._diagnostic = [False] * 16

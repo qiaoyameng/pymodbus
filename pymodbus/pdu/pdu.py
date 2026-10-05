@@ -3,9 +3,13 @@
 from __future__ import annotations
 
 import asyncio
+from typing import TYPE_CHECKING
 
 from ..datastore import ModbusServerContext
 from ..exceptions import ModbusIOException, NotImplementedException
+
+if TYPE_CHECKING:
+    from .device import ModbusDiagnosticState
 
 
 class ModbusPDU:
@@ -90,10 +94,13 @@ class ModbusPDU:
         """Decode data part of the message."""
 
     async def datastore_update(
-        self, context: ModbusServerContext, device_id: int
+        self,
+        context: ModbusServerContext,
+        device_id: int,
+        diagnostic: ModbusDiagnosticState | None = None,
     ) -> ModbusPDU:
         """Update diagnostic request on the given device."""
-        _ = context, device_id
+        _ = context, device_id, diagnostic
         raise NotImplementedException(
             f"update datastore called wrongly {self.__class__.__name__}"
         )

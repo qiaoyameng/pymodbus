@@ -30,7 +30,10 @@ class ReadCoilsRequest(ModbusPDU):
         self.verifyCount(self.MAX_COUNT)
 
     async def datastore_update(
-        self, context: ModbusServerContext, device_id: int
+        self,
+        context: ModbusServerContext,
+        device_id: int,
+        diagnostic=None,
     ) -> ModbusPDU:
         """Run request against a datastore."""
         values = await context.async_getValues(
@@ -98,7 +101,10 @@ class WriteSingleCoilRequest(WriteSingleCoilResponse):
     """WriteSingleCoilRequest."""
 
     async def datastore_update(
-        self, context: ModbusServerContext, device_id: int
+        self,
+        context: ModbusServerContext,
+        device_id: int,
+        diagnostic=None,
     ) -> ModbusPDU:
         """Run a request against a datastore."""
         if rc := await context.async_setValues(
@@ -166,7 +172,10 @@ class WriteMultipleCoilsRequest(ModbusPDU):
         ]
 
     async def datastore_update(
-        self, context: ModbusServerContext, device_id: int
+        self,
+        context: ModbusServerContext,
+        device_id: int,
+        diagnostic=None,
     ) -> ModbusPDU:
         """Run a request against a datastore."""
         if self.byte_count is None:

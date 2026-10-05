@@ -33,7 +33,10 @@ class ReadHoldingRegistersRequest(ModbusPDU):
         self.verifyCount(self.MAX_COUNT)
 
     async def datastore_update(
-        self, context: ModbusServerContext, device_id: int
+        self,
+        context: ModbusServerContext,
+        device_id: int,
+        diagnostic=None,
     ) -> ModbusPDU:
         """Update diagnostic request on the given device."""
         values = await context.async_getValues(
@@ -155,7 +158,10 @@ class ReadWriteMultipleRegistersRequest(ModbusPDU):
         ]
 
     async def datastore_update(
-        self, context: ModbusServerContext, device_id: int
+        self,
+        context: ModbusServerContext,
+        device_id: int,
+        diagnostic=None,
     ) -> ModbusPDU:
         """Update diagnostic request on the given device."""
         if not (1 <= self.read_count <= 0x07D):
@@ -210,7 +216,10 @@ class WriteSingleRegisterRequest(WriteSingleRegisterResponse):
     """WriteSingleRegisterRequest."""
 
     async def datastore_update(
-        self, context: ModbusServerContext, device_id: int
+        self,
+        context: ModbusServerContext,
+        device_id: int,
+        diagnostic=None,
     ) -> ModbusPDU:
         """Update diagnostic request on the given device."""
         if not 0 <= self.registers[0] <= 0xFFFF:
@@ -256,7 +265,10 @@ class WriteMultipleRegistersRequest(ModbusPDU):
         ]
 
     async def datastore_update(
-        self, context: ModbusServerContext, device_id: int
+        self,
+        context: ModbusServerContext,
+        device_id: int,
+        diagnostic=None,
     ) -> ModbusPDU:
         """Update diagnostic request on the given device."""
         if not 1 <= self.count <= 0x07B:
@@ -322,7 +334,10 @@ class MaskWriteRegisterRequest(ModbusPDU):
         self.address, self.and_mask, self.or_mask = struct.unpack(">HHH", data[:6])
 
     async def datastore_update(
-        self, context: ModbusServerContext, device_id: int
+        self,
+        context: ModbusServerContext,
+        device_id: int,
+        diagnostic=None,
     ) -> ModbusPDU:
         """Update diagnostic request on the given device."""
         if not 0x0000 <= self.and_mask <= 0xFFFF:

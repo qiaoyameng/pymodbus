@@ -8,12 +8,18 @@ from typing import cast
 from ..constants import ModbusPlusOperation
 from ..datastore import ModbusServerContext
 from .decoders import DecodePDU
-from .device import ModbusControlBlock
+from .device import ModbusControlBlock, ModbusDiagnosticState
 from .pdu import ModbusPDU
 from .utils import pack_bitstring
 
 
 _MCB = ModbusControlBlock()
+_DEFAULT_DIAGNOSTIC = ModbusDiagnosticState()
+
+
+def _state(diagnostic):
+    # Server diagnostic state, or a process wide default for standalone calls.
+    return diagnostic if diagnostic is not None else _DEFAULT_DIAGNOSTIC
 
 
 class DiagnosticBase(ModbusPDU):
@@ -71,10 +77,13 @@ class DiagnosticBase(ModbusPDU):
                 self.message = struct.unpack(">" + "H" * word_len, data[: 2 * word_len])
 
     async def datastore_update(
-        self, context: ModbusServerContext, device_id: int
+        self,
+        context: ModbusServerContext,
+        device_id: int,
+        diagnostic: ModbusDiagnosticState | None = None,
     ) -> ModbusPDU:
-        """Implement dummy."""
-        _ = context
+        """Implement default echo behavior."""
+        _ = context, diagnostic
         response = {
             DiagnosticBase.sub_function_code: DiagnosticBase,
             ReturnQueryDataResponse.sub_function_code: ReturnQueryDataResponse,
@@ -102,6 +111,21 @@ class RestartCommunicationsOptionRequest(DiagnosticBase):
 
     sub_function_code = 0x0001
 
+    async def datastore_update(
+        self,
+        context: ModbusServerContext,
+        device_id: int,
+        diagnostic: ModbusDiagnosticState | None = None,
+    ) -> ModbusPDU:
+        """Restart communications on the device, leaving listen-only mode."""
+        _ = context
+        state = _state(diagnostic)
+        # Data 0x0000 clears the event log and counters, 0xFF00 keeps them.
+        state.restart(device_id, clear_log=cast(int, self.message) == 0x0000)
+        return RestartCommunicationsOptionResponse(
+            message=self.message, dev_id=device_id, transaction_id=self.transaction_id
+        )
+
 
 class RestartCommunicationsOptionResponse(DiagnosticBase):
     """RestartCommunicationsOptionResponse."""
@@ -115,11 +139,15 @@ class ReturnDiagnosticRegisterRequest(DiagnosticBase):
     sub_function_code = 0x0002
 
     async def datastore_update(
-        self, context: ModbusServerContext, device_id: int
+        self,
+        context: ModbusServerContext,
+        device_id: int,
+        diagnostic: ModbusDiagnosticState | None = None,
     ) -> ModbusPDU:
         """Update diagnostic request on the given device."""
         _ = context
-        register = pack_bitstring(_MCB.getDiagnosticRegister())
+        device_register = _state(diagnostic).device(device_id).diagnostic_register
+        register = pack_bitstring(device_register)
         return ReturnDiagnosticRegisterResponse(
             message=register, dev_id=device_id, transaction_id=self.transaction_id
         )
@@ -137,7 +165,10 @@ class ChangeAsciiInputDelimiterRequest(DiagnosticBase):
     sub_function_code = 0x0003
 
     async def datastore_update(
-        self, context: ModbusServerContext, device_id: int
+        self,
+        context: ModbusServerContext,
+        device_id: int,
+        diagnostic: ModbusDiagnosticState | None = None,
     ) -> ModbusPDU:
         """Update diagnostic request on the given device."""
         _ = context
@@ -160,11 +191,14 @@ class ForceListenOnlyModeRequest(DiagnosticBase):
     sub_function_code = 0x0004
 
     async def datastore_update(
-        self, context: ModbusServerContext, device_id: int
+        self,
+        context: ModbusServerContext,
+        device_id: int,
+        diagnostic: ModbusDiagnosticState | None = None,
     ) -> ModbusPDU:
-        """Update diagnostic request on the given device."""
+        """Put only the addressed device into listen-only mode."""
         _ = context
-        _MCB.ListenOnly = True
+        _state(diagnostic).set_listen_only(device_id)
         return ForceListenOnlyModeResponse(
             dev_id=device_id, transaction_id=self.transaction_id
         )
@@ -190,11 +224,14 @@ class ClearCountersRequest(DiagnosticBase):
     sub_function_code = 0x000A
 
     async def datastore_update(
-        self, context: ModbusServerContext, device_id: int
+        self,
+        context: ModbusServerContext,
+        device_id: int,
+        diagnostic: ModbusDiagnosticState | None = None,
     ) -> ModbusPDU:
-        """Update diagnostic request on the given device."""
+        """Clear counters and event log of the addressed device only."""
         _ = context
-        _MCB.reset()
+        _state(diagnostic).clear_device_counters(device_id)
         return ClearCountersResponse(
             dev_id=device_id, transaction_id=self.transaction_id
         )
@@ -212,11 +249,14 @@ class ReturnBusMessageCountRequest(DiagnosticBase):
     sub_function_code = 0x000B
 
     async def datastore_update(
-        self, context: ModbusServerContext, device_id: int
+        self,
+        context: ModbusServerContext,
+        device_id: int,
+        diagnostic: ModbusDiagnosticState | None = None,
     ) -> ModbusPDU:
         """Update diagnostic request on the given device."""
         _ = context
-        count = _MCB.Counter.BusMessage
+        count = _state(diagnostic).counter_value("BusMessage", device_id)
         return ReturnBusMessageCountResponse(
             message=count, dev_id=device_id, transaction_id=self.transaction_id
         )
@@ -234,11 +274,14 @@ class ReturnBusCommunicationErrorCountRequest(DiagnosticBase):
     sub_function_code = 0x000C
 
     async def datastore_update(
-        self, context: ModbusServerContext, device_id: int
+        self,
+        context: ModbusServerContext,
+        device_id: int,
+        diagnostic: ModbusDiagnosticState | None = None,
     ) -> ModbusPDU:
         """Update diagnostic request on the given device."""
         _ = context
-        count = _MCB.Counter.BusCommunicationError
+        count = _state(diagnostic).counter_value("BusCommunicationError", device_id)
         return ReturnBusCommunicationErrorCountResponse(
             message=count, dev_id=device_id, transaction_id=self.transaction_id
         )
@@ -256,11 +299,14 @@ class ReturnBusExceptionErrorCountRequest(DiagnosticBase):
     sub_function_code = 0x000D
 
     async def datastore_update(
-        self, context: ModbusServerContext, device_id: int
+        self,
+        context: ModbusServerContext,
+        device_id: int,
+        diagnostic: ModbusDiagnosticState | None = None,
     ) -> ModbusPDU:
         """Update diagnostic request on the given device."""
         _ = context
-        count = _MCB.Counter.BusExceptionError
+        count = _state(diagnostic).counter_value("BusExceptionError", device_id)
         return ReturnBusExceptionErrorCountResponse(
             message=count, dev_id=device_id, transaction_id=self.transaction_id
         )
@@ -278,11 +324,14 @@ class ReturnDeviceMessageCountRequest(DiagnosticBase):
     sub_function_code = 0x000E
 
     async def datastore_update(
-        self, context: ModbusServerContext, device_id: int
+        self,
+        context: ModbusServerContext,
+        device_id: int,
+        diagnostic: ModbusDiagnosticState | None = None,
     ) -> ModbusPDU:
         """Update diagnostic request on the given device."""
         _ = context
-        count = _MCB.Counter.DeviceMessage
+        count = _state(diagnostic).counter_value("DeviceMessage", device_id)
         return ReturnDeviceMessageCountResponse(
             message=count, dev_id=device_id, transaction_id=self.transaction_id
         )
@@ -300,11 +349,14 @@ class ReturnDeviceNoResponseCountRequest(DiagnosticBase):
     sub_function_code = 0x000F
 
     async def datastore_update(
-        self, context: ModbusServerContext, device_id: int
+        self,
+        context: ModbusServerContext,
+        device_id: int,
+        diagnostic: ModbusDiagnosticState | None = None,
     ) -> ModbusPDU:
         """Update diagnostic request on the given device."""
         _ = context
-        count = _MCB.Counter.DeviceNoResponse
+        count = _state(diagnostic).counter_value("DeviceNoResponse", device_id)
         return ReturnDeviceNoResponseCountResponse(
             message=count, dev_id=device_id, transaction_id=self.transaction_id
         )
@@ -322,11 +374,14 @@ class ReturnDeviceNAKCountRequest(DiagnosticBase):
     sub_function_code = 0x0010
 
     async def datastore_update(
-        self, context: ModbusServerContext, device_id: int
+        self,
+        context: ModbusServerContext,
+        device_id: int,
+        diagnostic: ModbusDiagnosticState | None = None,
     ) -> ModbusPDU:
         """Update diagnostic request on the given device."""
         _ = context
-        count = _MCB.Counter.DeviceNAK
+        count = _state(diagnostic).counter_value("DeviceNAK", device_id)
         return ReturnDeviceNAKCountResponse(
             message=count, dev_id=device_id, transaction_id=self.transaction_id
         )
@@ -344,11 +399,14 @@ class ReturnDeviceBusyCountRequest(DiagnosticBase):
     sub_function_code = 0x0011
 
     async def datastore_update(
-        self, context: ModbusServerContext, device_id: int
+        self,
+        context: ModbusServerContext,
+        device_id: int,
+        diagnostic: ModbusDiagnosticState | None = None,
     ) -> ModbusPDU:
         """Update diagnostic request on the given device."""
         _ = context
-        count = _MCB.Counter.DEVICE_BUSY
+        count = _state(diagnostic).counter_value("DeviceBusy", device_id)
         return ReturnDeviceBusyCountResponse(
             message=count, dev_id=device_id, transaction_id=self.transaction_id
         )
@@ -366,11 +424,14 @@ class ReturnDeviceBusCharacterOverrunCountRequest(DiagnosticBase):
     sub_function_code = 0x0012
 
     async def datastore_update(
-        self, context: ModbusServerContext, device_id: int
+        self,
+        context: ModbusServerContext,
+        device_id: int,
+        diagnostic: ModbusDiagnosticState | None = None,
     ) -> ModbusPDU:
         """Update diagnostic request on the given device."""
         _ = context
-        count = _MCB.Counter.BusCharacterOverrun
+        count = _state(diagnostic).counter_value("BusCharacterOverrun", device_id)
         return ReturnDeviceBusCharacterOverrunCountResponse(
             message=count, dev_id=device_id, transaction_id=self.transaction_id
         )
@@ -388,11 +449,14 @@ class ReturnIopOverrunCountRequest(DiagnosticBase):
     sub_function_code = 0x0013
 
     async def datastore_update(
-        self, context: ModbusServerContext, device_id: int
+        self,
+        context: ModbusServerContext,
+        device_id: int,
+        diagnostic: ModbusDiagnosticState | None = None,
     ) -> ModbusPDU:
         """Update diagnostic request on the given device."""
         _ = context
-        count = _MCB.Counter.BusCharacterOverrun
+        count = _state(diagnostic).counter_value("BusCharacterOverrun", device_id)
         return ReturnIopOverrunCountResponse(
             message=count, dev_id=device_id, transaction_id=self.transaction_id
         )
@@ -410,11 +474,15 @@ class ClearOverrunCountRequest(DiagnosticBase):
     sub_function_code = 0x0014
 
     async def datastore_update(
-        self, context: ModbusServerContext, device_id: int
+        self,
+        context: ModbusServerContext,
+        device_id: int,
+        diagnostic: ModbusDiagnosticState | None = None,
     ) -> ModbusPDU:
         """Update diagnostic request on the given device."""
         _ = context
-        _MCB.Counter.BusCharacterOverrun = 0x0000
+        state = _state(diagnostic)
+        state.bus_counters.BusCharacterOverrun = 0x0000
         return ClearOverrunCountResponse(
             dev_id=device_id, transaction_id=self.transaction_id
         )
@@ -432,10 +500,13 @@ class GetClearModbusPlusRequest(DiagnosticBase):
     sub_function_code = 0x0015
 
     async def datastore_update(
-        self, context: ModbusServerContext, device_id: int
+        self,
+        context: ModbusServerContext,
+        device_id: int,
+        diagnostic: ModbusDiagnosticState | None = None,
     ) -> ModbusPDU:
         """Update diagnostic request on the given device."""
-        _ = context
+        _ = context, diagnostic
         message: int | list | None = None  # the clear operation does not return info
         if self.message == ModbusPlusOperation.CLEAR_STATISTICS:
             _MCB.Plus.reset()

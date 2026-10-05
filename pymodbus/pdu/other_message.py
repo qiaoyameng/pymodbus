@@ -8,11 +8,21 @@ from ..constants import ModbusStatus
 from ..datastore import ModbusServerContext
 from ..exceptions import ModbusIOException
 from .decoders import DecodePDU
-from .device import DeviceInformationFactory, ModbusControlBlock
+from .device import (
+    DeviceInformationFactory,
+    ModbusControlBlock,
+    ModbusDiagnosticState,
+)
 from .pdu import ModbusPDU
 
 
 _MCB = ModbusControlBlock()
+_DEFAULT_DIAGNOSTIC = ModbusDiagnosticState()
+
+
+def _state(diagnostic):
+    # Server diagnostic state, or a process wide default for standalone calls.
+    return diagnostic if diagnostic is not None else _DEFAULT_DIAGNOSTIC
 
 
 class ReadExceptionStatusRequest(ModbusPDU):
@@ -29,11 +39,14 @@ class ReadExceptionStatusRequest(ModbusPDU):
         """Decode data part of the message."""
 
     async def datastore_update(
-        self, context: ModbusServerContext, device_id: int
+        self,
+        context: ModbusServerContext,
+        device_id: int,
+        diagnostic: ModbusDiagnosticState | None = None,
     ) -> ModbusPDU:
         """Update diagnostic request on the given device."""
         _ = context
-        status = _MCB.Counter.summary()
+        status = _state(diagnostic).device(device_id).counters.summary()
         return ReadExceptionStatusResponse(
             status=status, dev_id=device_id, transaction_id=self.transaction_id
         )
@@ -72,11 +85,14 @@ class GetCommEventCounterRequest(ModbusPDU):
         """Decode data part of the message."""
 
     async def datastore_update(
-        self, context: ModbusServerContext, device_id: int
+        self,
+        context: ModbusServerContext,
+        device_id: int,
+        diagnostic: ModbusDiagnosticState | None = None,
     ) -> ModbusPDU:
         """Update diagnostic request on the given device."""
         _ = context
-        count = _MCB.Counter.Event
+        count = _state(diagnostic).device(device_id).counters.Event
         return GetCommEventCounterResponse(
             count=count, dev_id=device_id, transaction_id=self.transaction_id
         )
@@ -113,15 +129,19 @@ class GetCommEventLogRequest(ModbusPDU):
         """Decode data part of the message."""
 
     async def datastore_update(
-        self, context: ModbusServerContext, device_id: int
+        self,
+        context: ModbusServerContext,
+        device_id: int,
+        diagnostic: ModbusDiagnosticState | None = None,
     ) -> ModbusPDU:
         """Update diagnostic request on the given device."""
         _ = context
+        state = _state(diagnostic)
         return GetCommEventLogResponse(
             status=True,
-            message_count=_MCB.Counter.BusMessage,
-            event_count=_MCB.Counter.Event,
-            events=list(_MCB.getEvents()),
+            message_count=state.counter_value("BusMessage", device_id),
+            event_count=state.device(device_id).counters.Event,
+            events=list(state.device(device_id).events),
             dev_id=device_id,
             transaction_id=self.transaction_id,
         )
@@ -187,10 +207,13 @@ class ReportDeviceIdRequest(ModbusPDU):
         """Decode data part of the message."""
 
     async def datastore_update(
-        self, context: ModbusServerContext, device_id: int
+        self,
+        context: ModbusServerContext,
+        device_id: int,
+        diagnostic: ModbusDiagnosticState | None = None,
     ) -> ModbusPDU:
         """Update diagnostic request on the given device."""
-        _ = context
+        _ = context, diagnostic
         information = DeviceInformationFactory.get(_MCB)
         id_data = []
         for v_item in information.values():
