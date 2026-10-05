@@ -219,6 +219,9 @@ class TestDataStore:
             self.control.Counter.BusMessage += 1
             self.control.Counter.DeviceMessage += 1
         assert self.control.Counter.BusMessage == 10
+        self.control.Counter.BusMessage = 0xFFFF
+        self.control.Counter.BusMessage += 1
+        assert self.control.Counter.BusMessage == 0
         self.control.Counter.BusMessage = 0x00
         assert not self.control.Counter.BusMessage
         assert self.control.Counter.DeviceMessage == 10

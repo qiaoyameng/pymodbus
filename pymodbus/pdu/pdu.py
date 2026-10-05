@@ -90,10 +90,13 @@ class ModbusPDU:
         """Decode data part of the message."""
 
     async def datastore_update(
-        self, context: ModbusServerContext, device_id: int
+        self,
+        context: ModbusServerContext,
+        device_id: int,
+        diagnostics=None,
     ) -> ModbusPDU:
         """Update diagnostic request on the given device."""
-        _ = context, device_id
+        _ = context, device_id, diagnostics
         raise NotImplementedException(
             f"update datastore called wrongly {self.__class__.__name__}"
         )

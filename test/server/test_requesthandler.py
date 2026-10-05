@@ -4,12 +4,31 @@ from unittest import mock
 
 import pytest
 
+from pymodbus.constants import ModbusStatus
 from pymodbus.exceptions import ModbusIOException, NoSuchIdException
-from pymodbus.framer import FramerType
+from pymodbus.framer import FramerRTU, FramerType
 from pymodbus.pdu import ExceptionResponse
+from pymodbus.pdu.bit_message import ReadCoilsRequest
+from pymodbus.pdu.diag_message import (
+    ClearCountersRequest,
+    ForceListenOnlyModeRequest,
+    RestartCommunicationsOptionRequest,
+    ReturnBusMessageCountRequest,
+    ReturnDeviceMessageCountRequest,
+    ReturnQueryDataRequest,
+)
+from pymodbus.pdu.diagnostics import DiagnosticCounters
+from pymodbus.pdu.pdu import ModbusPDU
 from pymodbus.server import ModbusBaseServer
 from pymodbus.simulator import DataType, SimData, SimDevice
 from pymodbus.transport import CommParams, CommType
+
+
+def rtu_frame(pdu: ModbusPDU) -> bytes:
+    """Build an RTU frame for a populated PDU."""
+    from pymodbus.pdu import DecodePDU
+
+    return FramerRTU(DecodePDU(True)).buildFrame(pdu)
 
 
 class TestRequesthandler:
@@ -39,6 +58,52 @@ class TestRequesthandler:
         )
         conn = server.callback_new_connection()
         conn.pdu_send = mock.Mock(return_value=True)  # type: ignore[method-assign]
+        return conn
+
+    @pytest.fixture
+    async def diagnostic_handler(self):
+        """Provide an RTU handler backed by two logical devices."""
+        server = ModbusBaseServer(
+            CommParams(
+                comm_type=CommType.TCP,
+                comm_name="server_listener",
+                reconnect_delay=0.0,
+                reconnect_delay_max=0.0,
+                timeout_connect=0.0,
+                source_address=("0", 0),
+            ),
+            [
+                SimDevice(
+                    1,
+                    simdata=(
+                        [SimData(0, datatype=DataType.BITS, values=[True])],
+                        [SimData(0, datatype=DataType.BITS, values=[False])],
+                        [SimData(0)],
+                        [SimData(0)],
+                    ),
+                ),
+                SimDevice(
+                    2,
+                    simdata=(
+                        [SimData(0, datatype=DataType.BITS, values=[True])],
+                        [SimData(0, datatype=DataType.BITS, values=[False])],
+                        [SimData(0)],
+                        [SimData(0)],
+                    ),
+                ),
+            ],
+            False,
+            True,
+            None,
+            FramerType.RTU,
+            None,
+            None,
+            None,
+            [],
+        )
+        conn = server.callback_new_connection()
+        conn.pdu_send = mock.Mock(return_value=True)  # type: ignore[method-assign]
+        conn.handle_later = mock.Mock()
         return conn
 
     async def test_requesthandler(self, requesthandler):
@@ -106,6 +171,87 @@ class TestRequesthandler:
         assert response.dev_id == 1
         assert response.function_code == 0x80
         assert response.exception_code == 0x01
+
+    async def test_diagnostics_two_devices_and_listen_only(self, diagnostic_handler):
+        """Bus, device, exception, broadcast, and silence counters stay separate."""
+        server = diagnostic_handler.server
+        diagnostics = server.diagnostics
+
+        async def feed(pdu: ModbusPDU, *, bad_crc: bool = False) -> None:
+            frame = rtu_frame(pdu)
+            if bad_crc:
+                frame = frame[:-1] + bytes([frame[-1] ^ 0x01])
+            diagnostic_handler.callback_data(frame, None)
+            await diagnostic_handler.handle_request()
+
+        await feed(ReadCoilsRequest(address=999, count=1, dev_id=1), bad_crc=True)
+        await feed(ReadCoilsRequest(address=999, count=1, dev_id=1))
+        await feed(ReadCoilsRequest(address=0, count=1, dev_id=2))
+        await feed(ReturnQueryDataRequest(message=b"\x12\x34", dev_id=0))
+        await feed(ClearCountersRequest(dev_id=1))
+
+        assert diagnostics.bus.BusMessage == 4
+        assert diagnostics.device(1).counters.DeviceMessage == 0
+        assert diagnostics.device(1).counters.BusExceptionError == 0
+        assert diagnostics.device(1).counters.DeviceNoResponse == 0
+        assert not diagnostics.device(1).listen_only
+        assert diagnostics.device(2).counters.DeviceMessage == 2
+        assert diagnostics.device(2).counters.DeviceNoResponse == 1
+
+        await feed(ForceListenOnlyModeRequest(dev_id=1))
+        await feed(ReadCoilsRequest(address=0, count=1, dev_id=2))
+        await feed(ReadCoilsRequest(address=0, count=1, dev_id=1))
+
+        assert diagnostics.bus.BusMessage == 7
+        assert diagnostics.bus.BusCommunicationError == 1
+        assert diagnostics.bus.BusExceptionError == 1
+        assert diagnostics.device(1).counters.DeviceMessage == 2
+        assert diagnostics.device(1).counters.DeviceNoResponse == 2
+        assert diagnostics.device(2).counters.DeviceMessage == 3
+        assert diagnostics.device(2).counters.DeviceNoResponse == 1
+        assert diagnostics.device(1).listen_only
+        assert diagnostic_handler.pdu_send.call_count == 4
+
+        bus_count_response = await diagnostic_handler._datastore_update(
+            ReturnBusMessageCountRequest(dev_id=1), 1, diagnostics
+        )
+        assert bus_count_response.message == 7
+        device_count_response = await diagnostic_handler._datastore_update(
+            ReturnDeviceMessageCountRequest(dev_id=1), 1, diagnostics
+        )
+        assert device_count_response.message == 2
+
+        await feed(ReadCoilsRequest(address=0, count=1, dev_id=1))
+        assert diagnostic_handler.pdu_send.call_count == 4
+        await feed(
+            RestartCommunicationsOptionRequest(
+                message=ModbusStatus.OFF, dev_id=1
+            )
+        )
+        assert diagnostic_handler.pdu_send.call_count == 4
+        assert diagnostics.device(1).listen_only
+        await feed(
+            RestartCommunicationsOptionRequest(
+                message=ModbusStatus.ON, dev_id=1
+            )
+        )
+        assert diagnostic_handler.pdu_send.call_count == 4
+        await feed(ReadCoilsRequest(address=0, count=1, dev_id=1))
+
+        assert not diagnostics.device(1).listen_only
+        assert diagnostics.bus.BusMessage == 11
+        assert diagnostics.device(1).counters.DeviceMessage == 1
+        assert diagnostics.device(1).counters.DeviceNoResponse == 0
+        assert diagnostic_handler.pdu_send.call_count == 5
+
+    def test_diagnostic_counters_wrap_at_16_bits(self):
+        """All diagnostic counters use the fixed Modbus 16-bit wrap rule."""
+        counters = DiagnosticCounters()
+        counters.values["BusMessage"] = 0xFFFF
+
+        counters.increment("BusMessage")
+
+        assert counters.BusMessage == 0
 
     async def test_rh_handle_request(self, requesthandler):
         """Test __init__."""

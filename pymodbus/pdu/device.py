@@ -22,6 +22,18 @@ from ..utilities import dict_property
 from .events import ModbusEvent
 
 
+def counter_property(index: int):
+    """Create a 16-bit wrapping counter property."""
+
+    def getter(self) -> int:
+        return self.stat_data[index]
+
+    def setter(self, value: int) -> None:
+        self.stat_data[index] = int(value) & 0xFFFF
+
+    return property(getter, setter)
+
+
 # ---------------------------------------------------------------------------#
 #  Modbus Plus Statistics
 # ---------------------------------------------------------------------------#
@@ -414,15 +426,15 @@ class ModbusCountersHandler:
     #  Properties
     # -------------------------------------------------------------------------#
     # fmt: off
-    BusMessage = dict_property(lambda s: s.stat_data, 0)
-    BusCommunicationError = dict_property(lambda s: s.stat_data, 1)
-    BusExceptionError = dict_property(lambda s: s.stat_data, 2)
-    DeviceMessage = dict_property(lambda s: s.stat_data, 3)
-    DeviceNoResponse = dict_property(lambda s: s.stat_data, 4)
-    DeviceNAK = dict_property(lambda s: s.stat_data, 5)
-    DEVICE_BUSY = dict_property(lambda s: s.stat_data, 6)
-    BusCharacterOverrun = dict_property(lambda s: s.stat_data, 7)
-    Event = dict_property(lambda s: s.stat_data, 8)
+    BusMessage = counter_property(0)
+    BusCommunicationError = counter_property(1)
+    BusExceptionError = counter_property(2)
+    DeviceMessage = counter_property(3)
+    DeviceNoResponse = counter_property(4)
+    DeviceNAK = counter_property(5)
+    DEVICE_BUSY = counter_property(6)
+    BusCharacterOverrun = counter_property(7)
+    Event = counter_property(8)
     # fmt: on
 
 

@@ -36,6 +36,7 @@ class FramerBase:
     ) -> None:
         """Initialize a ADU (framer) instance."""
         self.decoder = decoder
+        self.frame_error_callback = None
 
     def decode(self, _data: bytes) -> tuple[int, int, int, bytes]:
         """Decode ADU.

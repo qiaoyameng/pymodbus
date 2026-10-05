@@ -63,7 +63,7 @@ class FramerAscii(FramerBase):
                 Log.debug("Incomplete frame: {} wait for more data", data, ":hex")
                 return used_len, 0, 0, self.EMPTY
             dev_id = int(buffer[1:3], 16)
-            used_len += end + len(end_marker)
+            frame_len = end + len(end_marker)
             try:
                 lrc = int(buffer[end - 2 : end], 16)
                 msg = a2b_hex(buffer[1 : end - 2])
@@ -72,7 +72,11 @@ class FramerAscii(FramerBase):
                 return data_len, dev_id, 0, self.EMPTY
             if not self.check_LRC(msg, lrc):
                 Log.debug("LRC wrong in frame: {} skipping", data, ":hex")
+                if self.frame_error_callback:
+                    self.frame_error_callback(dev_id)
+                used_len += frame_len
                 continue
+            used_len += frame_len
             return used_len, dev_id, 0, msg[1:]
 
     def encode(self, payload: bytes, device_id: int, _tid: int) -> bytes:
